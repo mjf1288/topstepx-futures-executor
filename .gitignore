@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+orders_state.json
+combine_tracker.json
+futures_scan_results.json
+session_log_*.txt
+*.log

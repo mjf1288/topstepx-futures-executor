@@ -1,0 +1,41 @@
+{
+  "instruments": {
+    "MNQ": {
+      "mode": "NEUTRAL",
+      "regime": "NEUTRAL",
+      "strength": "WEAK",
+      "dss_signal": 1,
+      "lyap_signal": 2,
+      "combined_signal": 3,
+      "computed_at": "2026-03-09T23:55:50.996841-04:00"
+    },
+    "MES": {
+      "mode": "NEUTRAL",
+      "regime": "NEUTRAL",
+      "strength": "WEAK",
+      "dss_signal": 1,
+      "lyap_signal": 2,
+      "combined_signal": 3,
+      "computed_at": "2026-03-09T23:55:50.996841-04:00"
+    },
+    "MYM": {
+      "mode": "NEUTRAL",
+      "regime": "NEUTRAL",
+      "strength": "WEAK",
+      "dss_signal": 1,
+      "lyap_signal": 2,
+      "combined_signal": 3,
+      "computed_at": "2026-03-09T23:55:50.996841-04:00"
+    },
+    "M2K": {
+      "mode": "NEUTRAL",
+      "regime": "NEUTRAL",
+      "strength": "WEAK",
+      "dss_signal": 1,
+      "lyap_signal": 2,
+      "combined_signal": 3,
+      "computed_at": "2026-03-09T23:55:50.996841-04:00"
+    }
+  },
+  "last_updated": "2026-03-09T23:55:50.996841-04:00"
+}
