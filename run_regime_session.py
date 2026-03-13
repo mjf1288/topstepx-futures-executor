@@ -150,7 +150,12 @@ def save_orders(state: dict):
 
 
 async def cancel_all_pending(client, orders_state: dict) -> int:
-    """Cancel all pending limit orders (entry + stop + target) from prior session."""
+    """Cancel stale UNFILLED limit entries (+ their brackets) from prior session.
+    
+    CRITICAL: If the entry order was FILLED, we must KEEP the stop and target
+    alive to protect the open position. Only cancel entries that are still
+    pending (unfilled).
+    """
     import aiohttp
 
     pending = orders_state.get("pending_limits", {})
@@ -161,9 +166,29 @@ async def cancel_all_pending(client, orders_state: dict) -> int:
     base_url = client.base_url
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     cancelled = 0
+    kept = 0
+
+    # Get open positions to check which entries have filled
+    open_positions = await client.search_open_positions()
+    positioned_symbols = set()
+    for p in open_positions:
+        cid = getattr(p, 'contractId', '')
+        parts = cid.split('.')
+        sym = parts[3] if len(parts) >= 4 else cid
+        positioned_symbols.add(sym)
 
     async with aiohttp.ClientSession() as http:
         for key, info in list(pending.items()):
+            symbol = info.get("symbol", key.split("_")[0])
+
+            # If this symbol has an open position, the entry FILLED.
+            # Keep the stop and target orders alive to protect it.
+            if symbol in positioned_symbols:
+                print(f"  KEEPING brackets for {symbol} \u2014 entry filled, position open")
+                kept += 1
+                continue
+
+            # Entry did NOT fill (or position already closed) \u2014 cancel everything
             for oid_key in ["entry_order_id", "stop_order_id", "target_order_id"]:
                 oid = info.get(oid_key)
                 if not oid:
@@ -178,6 +203,8 @@ async def cancel_all_pending(client, orders_state: dict) -> int:
                     pass
             del pending[key]
 
+    if kept:
+        print(f"  Kept {kept} bracket(s) for open positions")
     return cancelled
 
 
@@ -299,19 +326,18 @@ async def run_regime_session(
 
         # Daily profit cap check
         if live and daily_pnl >= DAILY_PROFIT_CAP:
-            print(f"\n  DAILY PROFIT CAP REACHED — no new orders today.")
+            print(f"\n  DAILY PROFIT CAP REACHED \u2014 no new orders today.")
             return {"status": "daily_cap_reached"}
 
-        # ── Step 1: Cancel stale pending limits ──
+        # \u2500\u2500 Step 1: Cancel stale pending limits \u2500\u2500
         if live:
-            print(f"\n  ── CANCELLING STALE ORDERS ──")
+            print(f"\n  \u2500\u2500 CANCELLING STALE ORDERS \u2500\u2500")
             cancelled = await cancel_all_pending(client, orders_state)
-            orders_state["pending_limits"] = {}
             save_orders(orders_state)
             print(f"  Cancelled {cancelled} order(s) from prior session.")
 
-        # ── Step 2: Compute regime + levels for each symbol ──
-        print(f"\n  ── SCANNING ──")
+        # \u2500\u2500 Step 2: Compute regime + levels for each symbol \u2500\u2500
+        print(f"\n  \u2500\u2500 SCANNING \u2500\u2500")
 
         for symbol in symbols:
             print(f"\n  [{symbol}] ---")
@@ -341,7 +367,7 @@ async def run_regime_session(
                 else:
                     mode = "NEUTRAL"
 
-                mode_icon = {"BUY": "▲", "SELL": "▼", "NEUTRAL": "●"}[mode]
+                mode_icon = {"BUY": "\u25b2", "SELL": "\u25bc", "NEUTRAL": "\u25cf"}[mode]
                 print(f"  [{symbol}] Regime: {mode_icon} {mode} "
                       f"(DSS={bias['dss_signal']:+d} Lyap={bias['lyap_signal']:+d} "
                       f"Combined={bias['combined_signal']:+d})")
@@ -452,7 +478,7 @@ async def run_regime_session(
                 # MLL gate
                 balance_after_loss = balance - best["dollar_risk"]
                 if balance_after_loss < mll_floor:
-                    print(f"  [{symbol}] MLL BLOCK — stop-out would drop to "
+                    print(f"  [{symbol}] MLL BLOCK \u2014 stop-out would drop to "
                           f"${balance_after_loss:,.0f} < floor ${mll_floor:,.0f}")
                     all_results.append({"symbol": symbol, "regime": regime_data,
                                         "action": "mll_blocked",
@@ -471,7 +497,7 @@ async def run_regime_session(
                     open_lots += getattr(p, 'size', 1)
 
                 if symbol in positioned_symbols:
-                    print(f"  [{symbol}] Already has open position — skip")
+                    print(f"  [{symbol}] Already has open position \u2014 skip")
                     all_results.append({"symbol": symbol, "regime": regime_data,
                                         "action": "already_positioned"})
                     continue
@@ -483,11 +509,11 @@ async def run_regime_session(
                     continue
 
                 # Display the order
-                icon = "▲" if best["side"] == 0 else "▼"
+                icon = "\u25b2" if best["side"] == 0 else "\u25bc"
                 print(f"\n  [{symbol}] {icon} {best['side_str']} LIMIT 1 @ {best['entry']}")
                 print(f"    Level: {best['level']} (strength {best['strength']})")
-                print(f"    Stop:   {best['stop']} — ${best['dollar_risk']:.0f} risk")
-                print(f"    Target: {best['target']} — ${best['dollar_target']:.0f}")
+                print(f"    Stop:   {best['stop']} \u2014 ${best['dollar_risk']:.0f} risk")
+                print(f"    Target: {best['target']} \u2014 ${best['dollar_target']:.0f}")
                 print(f"    R:R = 1:{rr_ratio} | Dist: {best['dist_pct']}%")
 
                 if len(candidates) > 1:
@@ -502,11 +528,11 @@ async def run_regime_session(
                             best["side"], best["entry"],
                             best["stop"], best["target"],
                         )
-                        print(f"    LIMIT PLACED — Entry: {ids['entry_order_id']}")
+                        print(f"    LIMIT PLACED \u2014 Entry: {ids['entry_order_id']}")
                         if ids["stop_order_id"]:
-                            print(f"    STOP PLACED  — {ids['stop_order_id']} @ {best['stop']}")
+                            print(f"    STOP PLACED  \u2014 {ids['stop_order_id']} @ {best['stop']}")
                         if ids["target_order_id"]:
-                            print(f"    TARGET PLACED — {ids['target_order_id']} @ {best['target']}")
+                            print(f"    TARGET PLACED \u2014 {ids['target_order_id']} @ {best['target']}")
 
                         order_key = f"{symbol}_{best['level']}"
                         orders_state["pending_limits"][order_key] = {
@@ -556,13 +582,13 @@ async def run_regime_session(
 
     if placed:
         total_risk = sum(r["order"]["dollar_risk"] for r in placed)
-        print(f"  PLACED: {len(placed)} limit(s) — ${total_risk:,.0f} total risk")
+        print(f"  PLACED: {len(placed)} limit(s) \u2014 ${total_risk:,.0f} total risk")
         for r in placed:
             o = r["order"]
             print(f"    {r['symbol']} {o['side_str']} @ {o['entry']} ({o['level']})")
     if dry:
         total_risk = sum(r["order"]["dollar_risk"] for r in dry)
-        print(f"  DRY RUN: {len(dry)} limit(s) would be placed — ${total_risk:,.0f} risk")
+        print(f"  DRY RUN: {len(dry)} limit(s) would be placed \u2014 ${total_risk:,.0f} risk")
         for r in dry:
             o = r["order"]
             print(f"    {r['symbol']} {o['side_str']} @ {o['entry']} ({o['level']})")
@@ -574,7 +600,7 @@ async def run_regime_session(
         print(f"  ERRORS: {len(errors)}")
 
     if not placed and not dry:
-        print(f"  No orders — all instruments NEUTRAL or blocked")
+        print(f"  No orders \u2014 all instruments NEUTRAL or blocked")
 
     print(f"{'='*65}\n")
 
@@ -587,7 +613,7 @@ async def run_regime_session(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Regime Session — 8h Filter → Limit Orders")
+    parser = argparse.ArgumentParser(description="Regime Session \u2014 8h Filter \u2192 Limit Orders")
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--atr-mult", type=float, default=DEFAULT_ATR_MULTIPLIER)
