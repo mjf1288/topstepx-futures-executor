@@ -50,6 +50,138 @@ from trend_filters import compute_trend_bias
 from mean_levels_calc import compute_mean_levels, compute_atr
 
 # ─────────────────────────────────────────────────────────────
+# CONTRACT ROLL STITCHING
+# ─────────────────────────────────────────────────────────────
+
+# CME quarterly months: H=Mar, M=Jun, U=Sep, Z=Dec
+QUARTERLY_MONTHS = ["H", "M", "U", "Z"]
+QUARTERLY_MONTH_NUMS = {"H": 3, "M": 6, "U": 9, "Z": 12}
+
+
+def _prev_quarterly_month(current_code: str) -> tuple[str, int]:
+    """Return (month_code, year_offset) for the prior quarterly contract."""
+    idx = QUARTERLY_MONTHS.index(current_code)
+    if idx == 0:
+        return QUARTERLY_MONTHS[-1], -1  # H→Z, year-1
+    return QUARTERLY_MONTHS[idx - 1], 0
+
+
+def _parse_contract_id(contract_id: str) -> tuple[str, str, str]:
+    """Parse 'CON.F.US.MNQ.M26' → ('MNQ', 'M', '26')."""
+    parts = contract_id.split(".")
+    sym = parts[3]
+    month_code = parts[4][0]
+    year_suffix = parts[4][1:]
+    return sym, month_code, year_suffix
+
+
+async def fetch_bars_with_rollstitch(
+    client, symbol: str, contract_id: str,
+    days: int, interval: int, unit: int, min_bars: int = 20,
+) -> "pl.DataFrame":
+    """Fetch bars for current contract; if too few, stitch prior contract data.
+
+    When contracts roll (e.g. H26→M26) the new contract ID has very little
+    history.  This function detects that and back-fills from the prior
+    contract, adjusting OHLC prices by the roll gap so the series is
+    continuous.
+    """
+    import polars as pl
+    import aiohttp
+
+    # 1. Fetch current contract bars normally
+    bars = await client.get_bars(symbol, days=days, interval=interval, unit=unit)
+    if not bars.is_empty() and len(bars) >= min_bars:
+        return bars  # Enough data — no stitching needed
+
+    # 2. Build prior contract ID
+    sym, month_code, year_suffix = _parse_contract_id(contract_id)
+    prev_month, yr_offset = _prev_quarterly_month(month_code)
+    prev_year = int(year_suffix) + yr_offset
+    prev_contract = f"CON.F.US.{sym}.{prev_month}{prev_year:02d}"
+
+    print(f"  [{symbol}] Roll stitch: {contract_id} has {len(bars)} bars, "
+          f"fetching {prev_contract}...")
+
+    # 3. Fetch prior contract bars via raw API
+    token = client.get_session_token()
+    base_url = client.base_url
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    tz = pytz.timezone("America/Chicago")
+    now = datetime.now(tz)
+    start = now - __import__("datetime").timedelta(days=days)
+
+    async with aiohttp.ClientSession() as http:
+        payload = {
+            "contractId": prev_contract,
+            "live": False,
+            "startTime": start.astimezone(pytz.UTC).isoformat(),
+            "endTime": now.astimezone(pytz.UTC).isoformat(),
+            "unit": unit,
+            "unitNumber": interval,
+            "limit": 300,
+            "includePartialBar": True,
+        }
+        async with http.post(f"{base_url}/History/retrieveBars",
+                             json=payload, headers=headers) as resp:
+            result = await resp.json()
+
+    if not result.get("success") or not result.get("bars"):
+        print(f"  [{symbol}] Prior contract {prev_contract} returned no data")
+        return bars  # Return whatever we have
+
+    # 4. Build prior DataFrame
+    old_raw = result["bars"]
+    old_df = (
+        pl.DataFrame(old_raw)
+        .sort("t")
+        .rename({"t": "timestamp", "o": "open", "h": "high",
+                 "l": "low", "c": "close", "v": "volume"})
+    )
+    try:
+        old_df = old_df.with_columns(
+            pl.col("timestamp").str.to_datetime()
+            .dt.replace_time_zone("UTC")
+            .dt.convert_time_zone("America/Chicago")
+        )
+    except Exception:
+        old_df = old_df.with_columns(
+            pl.col("timestamp").cast(pl.Datetime).dt.replace_time_zone("UTC")
+            .dt.convert_time_zone("America/Chicago")
+        )
+
+    if bars.is_empty():
+        print(f"  [{symbol}] Using {len(old_df)} bars from prior contract (no new data)")
+        return old_df
+
+    # 5. Compute roll gap: last old close vs first new open
+    #    Trim old bars to only those BEFORE the first new bar
+    first_new_ts = bars["timestamp"][0]
+    old_df = old_df.filter(pl.col("timestamp") < first_new_ts)
+
+    if old_df.is_empty():
+        return bars
+
+    last_old_close = old_df["close"][-1]
+    first_new_open = bars["open"][0]
+    gap = first_new_open - last_old_close  # Positive = new contract trades higher
+
+    # 6. Adjust old prices by the gap
+    old_adjusted = old_df.with_columns([
+        (pl.col("open") + gap).alias("open"),
+        (pl.col("high") + gap).alias("high"),
+        (pl.col("low") + gap).alias("low"),
+        (pl.col("close") + gap).alias("close"),
+    ])
+
+    # 7. Concatenate: old (adjusted) + new
+    stitched = pl.concat([old_adjusted, bars]).sort("timestamp")
+    print(f"  [{symbol}] Stitched {len(old_adjusted)} old + {len(bars)} new = "
+          f"{len(stitched)} bars (gap: {gap:+.2f} pts)")
+    return stitched
+
+
+# ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
 DEFAULT_SYMBOLS = ["MNQ", "MES", "MYM", "M2K"]
@@ -354,8 +486,11 @@ async def run_regime_session(
                 tick_size = instrument.tickSize
                 tick_value = instrument.tickValue
 
-                # Fetch 8h bars for regime
-                bars_8h = await client.get_bars(symbol, days=60, interval=8, unit=3)
+                # Fetch 8h bars for regime (with roll stitching)
+                bars_8h = await fetch_bars_with_rollstitch(
+                    client, symbol, contract_id,
+                    days=60, interval=8, unit=3, min_bars=20,
+                )
                 if bars_8h.is_empty() or len(bars_8h) < 20:
                     print(f"  [{symbol}] Not enough 8h bars ({len(bars_8h)})")
                     continue
@@ -393,8 +528,11 @@ async def run_regime_session(
                                         "action": "skip_neutral"})
                     continue
 
-                # Fetch 5-min bars for mean levels
-                bars_5m = await client.get_bars(symbol, days=35, interval=5, unit=2)
+                # Fetch 5-min bars for mean levels (with roll stitching)
+                bars_5m = await fetch_bars_with_rollstitch(
+                    client, symbol, contract_id,
+                    days=35, interval=5, unit=2, min_bars=100,
+                )
                 if bars_5m.is_empty() or len(bars_5m) < 100:
                     print(f"  [{symbol}] Not enough 5m bars")
                     continue
@@ -411,8 +549,11 @@ async def run_regime_session(
                 print(f"    CDM: {cdm}  PDM: {pdm}")
                 print(f"    CMM: {cmm}  PMM: {pmm}")
 
-                # Fetch daily bars for ATR
-                daily_bars = await client.get_bars(symbol, days=35, interval=1, unit=4)
+                # Fetch daily bars for ATR (with roll stitching)
+                daily_bars = await fetch_bars_with_rollstitch(
+                    client, symbol, contract_id,
+                    days=35, interval=1, unit=4, min_bars=15,
+                )
                 if daily_bars.is_empty() or len(daily_bars) < 15:
                     import polars as pl
                     daily_bars = bars_5m.with_columns(
