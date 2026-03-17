@@ -549,6 +549,21 @@ async def run_regime_session(
                 print(f"    CDM: {cdm}  PDM: {pdm}")
                 print(f"    CMM: {cmm}  PMM: {pmm}")
 
+                # CMM structure gate: only BUY above CMM, only SELL below CMM
+                if cmm is not None:
+                    if mode == "BUY" and current_price < cmm:
+                        print(f"  [{symbol}] CMM GATE — price {current_price} < CMM {cmm}, "
+                              f"skipping BUY (need price above monthly mean)")
+                        all_results.append({"symbol": symbol, "regime": regime_data,
+                                            "action": "cmm_gate_blocked"})
+                        continue
+                    elif mode == "SELL" and current_price > cmm:
+                        print(f"  [{symbol}] CMM GATE — price {current_price} > CMM {cmm}, "
+                              f"skipping SELL (need price below monthly mean)")
+                        all_results.append({"symbol": symbol, "regime": regime_data,
+                                            "action": "cmm_gate_blocked"})
+                        continue
+
                 # Fetch daily bars for ATR (with roll stitching)
                 daily_bars = await fetch_bars_with_rollstitch(
                     client, symbol, contract_id,
@@ -724,7 +739,7 @@ async def run_regime_session(
     dry = [r for r in all_results if r["action"] == "dry_run"]
     skipped = [r for r in all_results if r["action"] in ("skip_neutral", "no_eligible_levels",
                                                            "mll_blocked", "already_positioned",
-                                                           "max_contracts")]
+                                                           "max_contracts", "cmm_gate_blocked")]
     errors = [r for r in all_results if r["action"] == "error"]
 
     if placed:
