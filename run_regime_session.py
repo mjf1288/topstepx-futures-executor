@@ -196,6 +196,8 @@ MAX_TOTAL_CONTRACTS = 4
 
 DEFAULT_ATR_MULTIPLIER = 1.0
 DEFAULT_RR_RATIO = 2.0
+MIN_ATR_MULTIPLIER = 0.4      # Floor — never go tighter than 0.4x ATR
+MLL_CUSHION_BUFFER = 10       # Keep $10 buffer above MLL floor
 
 # Level strength (monthly > daily)
 LEVEL_STRENGTH = {"CMM": 4, "PMM": 3, "CDM": 2, "PDM": 1}
@@ -580,7 +582,36 @@ async def run_regime_session(
                     ]).sort("date")
 
                 atr = compute_atr(daily_bars, period=14)
-                stop_dist = atr * atr_mult
+
+                # Dynamic ATR multiplier: scale stop to fit MLL cushion
+                # if needed, but never go below MIN_ATR_MULTIPLIER
+                usable_cushion = cushion - MLL_CUSHION_BUFFER
+                dollar_per_point = tick_value / tick_size
+                full_stop_risk = atr * atr_mult * dollar_per_point
+                effective_mult = atr_mult
+
+                if full_stop_risk > usable_cushion and usable_cushion > 0:
+                    # Scale down multiplier to fit
+                    fitted_mult = usable_cushion / (atr * dollar_per_point)
+                    if fitted_mult >= MIN_ATR_MULTIPLIER:
+                        effective_mult = round(fitted_mult, 2)
+                        print(f"    MLL TIGHT — reducing stop from {atr_mult}x to "
+                              f"{effective_mult}x ATR to fit ${usable_cushion:.0f} cushion")
+                    else:
+                        print(f"  [{symbol}] MLL BLOCK — even {MIN_ATR_MULTIPLIER}x ATR "
+                              f"(${atr * MIN_ATR_MULTIPLIER * dollar_per_point:.0f}) > "
+                              f"${usable_cushion:.0f} cushion")
+                        all_results.append({"symbol": symbol, "regime": regime_data,
+                                            "action": "mll_blocked",
+                                            "dollar_risk": full_stop_risk})
+                        continue
+                elif usable_cushion <= 0:
+                    print(f"  [{symbol}] MLL BLOCK — no usable cushion")
+                    all_results.append({"symbol": symbol, "regime": regime_data,
+                                        "action": "mll_blocked", "dollar_risk": full_stop_risk})
+                    continue
+
+                stop_dist = atr * effective_mult
                 stop_dist = max(stop_dist, tick_size * 4)
 
                 # Dollar risk for 1 contract
@@ -588,7 +619,8 @@ async def run_regime_session(
                 dollar_risk = ticks_to_stop * tick_value
                 dollar_target = dollar_risk * rr_ratio
 
-                print(f"    ATR(14d): {atr:.2f} | Stop: {stop_dist:.2f} pts | "
+                mult_note = f" (reduced from {atr_mult}x)" if effective_mult != atr_mult else ""
+                print(f"    ATR(14d): {atr:.2f} | Stop: {stop_dist:.2f} pts @ {effective_mult}x{mult_note} | "
                       f"Risk/lot: ${dollar_risk:.0f} | Target: ${dollar_target:.0f}")
 
                 # Build candidate levels
@@ -609,6 +641,7 @@ async def run_regime_session(
                             "side": 0, "side_str": "BUY",
                             "entry": entry, "stop": stop, "target": target,
                             "dollar_risk": dollar_risk, "dollar_target": dollar_target,
+                            "atr_mult_used": effective_mult,
                             "dist_pct": round(abs(current_price - entry) / current_price * 100, 2),
                         })
 
@@ -622,6 +655,7 @@ async def run_regime_session(
                             "side": 1, "side_str": "SELL",
                             "entry": entry, "stop": stop, "target": target,
                             "dollar_risk": dollar_risk, "dollar_target": dollar_target,
+                            "atr_mult_used": effective_mult,
                             "dist_pct": round(abs(current_price - entry) / current_price * 100, 2),
                         })
 
@@ -636,16 +670,6 @@ async def run_regime_session(
 
                 # Pick the strongest level
                 best = candidates[0]
-
-                # MLL gate
-                balance_after_loss = balance - best["dollar_risk"]
-                if balance_after_loss < mll_floor:
-                    print(f"  [{symbol}] MLL BLOCK — stop-out would drop to "
-                          f"${balance_after_loss:,.0f} < floor ${mll_floor:,.0f}")
-                    all_results.append({"symbol": symbol, "regime": regime_data,
-                                        "action": "mll_blocked",
-                                        "dollar_risk": best["dollar_risk"]})
-                    continue
 
                 # Check existing positions
                 existing = await client.search_open_positions()
