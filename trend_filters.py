@@ -344,63 +344,64 @@ def compute_trend_bias(
     lyap_params: dict = None,
 ) -> dict:
     """
-    Compute combined trend bias from DSS Bressert and Lyapunov HP.
+    Compute trend bias from DSS Bressert only.
+
+    Lyapunov HP was previously combined with DSS but acted as an
+    over-filter that pushed too many signals to NEUTRAL, costing
+    entries.  The CMM structure gate now provides the directional
+    confirmation that Lyapunov used to supply.
+
+    DSS signal range: -10 to +10
+    Bias thresholds (DSS-only):
+      >= +4  → BULLISH
+      <= -4  → BEARISH
+      else   → NEUTRAL
 
     Args:
         highs: Array of high prices
         lows: Array of low prices
         closes: Array of close prices
         dss_params: Override DSS parameters (optional)
-        lyap_params: Override Lyapunov parameters (optional)
+        lyap_params: Ignored (kept for API compatibility)
 
     Returns:
         dict with:
           - dss_signal: int (-10 to +10)
-          - lyap_signal: int (-10 to +10)
-          - combined_signal: int (-20 to +20)
+          - lyap_signal: int (always 0, kept for compatibility)
+          - combined_signal: int (same as dss_signal)
           - bias: 'BULLISH', 'BEARISH', or 'NEUTRAL'
           - strength: 'STRONG', 'MODERATE', or 'WEAK'
-          - can_break_above: bool (should we trade break above?)
-          - can_break_below: bool (should we trade break below?)
+          - can_break_above: bool
+          - can_break_below: bool
     """
-    # Initialize filters
+    # DSS Bressert only
     dss = DSSBressert(**(dss_params or {}))
-    lyap = LyapunovHP(**(lyap_params or {}))
-
-    # Calculate
     dss.calculate(highs, lows, closes)
-    lyap.calculate(closes)
-
-    # Get signals
     dss_signal = dss.get_signal()
-    lyap_signal = lyap.get_signal()
-    combined = dss_signal + lyap_signal
 
-    # Determine bias
-    if combined >= 6:
+    # Lyapunov removed — zero out for log compatibility
+    lyap_signal = 0
+    combined = dss_signal
+
+    # Determine bias (DSS-only thresholds)
+    if combined >= 4:
         bias = 'BULLISH'
-    elif combined <= -6:
+    elif combined <= -4:
         bias = 'BEARISH'
     else:
         bias = 'NEUTRAL'
 
     # Determine strength
     abs_combined = abs(combined)
-    if abs_combined >= 14:
+    if abs_combined >= 8:
         strength = 'STRONG'
-    elif abs_combined >= 8:
+    elif abs_combined >= 5:
         strength = 'MODERATE'
     else:
         strength = 'WEAK'
 
-    # Trading rules:
-    # - BULLISH bias → can trade break_above, skip break_below
-    # - BEARISH bias → can trade break_below, skip break_above
-    # - NEUTRAL → skip both (no clear edge)
-    # - STRONG signal → trade with conviction
-    # - With at least one filter agreeing (signal > 0 for bullish), allow the trade
-    can_break_above = combined > 0 and (dss_signal > 0 or lyap_signal > 0)
-    can_break_below = combined < 0 and (dss_signal < 0 or lyap_signal < 0)
+    can_break_above = combined > 0
+    can_break_below = combined < 0
 
     return {
         'dss_signal': dss_signal,
@@ -412,5 +413,5 @@ def compute_trend_bias(
         'can_break_below': can_break_below,
         'dss_last': dss.dss_values[-1] if dss.dss_values else 50,
         'dss_signal_line': dss.signal_values[-1] if dss.signal_values else 50,
-        'lyap_last': lyap.lyapunov_values[-1] if lyap.lyapunov_values else 0,
+        'lyap_last': 0,
     }
