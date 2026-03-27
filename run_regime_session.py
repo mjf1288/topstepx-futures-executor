@@ -190,7 +190,7 @@ async def fetch_bars_with_rollstitch(
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
-DEFAULT_SYMBOLS = ["MNQ", "MES", "MYM", "M2K"]
+DEFAULT_SYMBOLS = ["MNQ", "MES", "MYM"]  # M2K removed — drag on strategy (0.97 PF)
 
 COMBINE_STARTING_BALANCE = 50_000
 COMBINE_MLL = 2_000
