@@ -342,20 +342,22 @@ def compute_trend_bias(
     closes: list[float],
     dss_params: dict = None,
     lyap_params: dict = None,
+    latched_mode: str = None,
 ) -> dict:
     """
-    Compute trend bias from DSS Bressert only.
+    Compute trend bias from DSS Bressert with latching regime.
 
-    Lyapunov HP was previously combined with DSS but acted as an
-    over-filter that pushed too many signals to NEUTRAL, costing
-    entries.  The CMM structure gate now provides the directional
-    confirmation that Lyapunov used to supply.
+    v5.0 LATCHING MODE:
+    Once DSS triggers BUY (>= +4) or SELL (<= -4), that mode LATCHES
+    and persists across all subsequent sessions until an opposite
+    trigger fires.  The +1 to +3 continuation values keep the existing
+    bias alive instead of resetting to NEUTRAL.
 
-    DSS signal range: -10 to +10
-    Bias thresholds (DSS-only):
-      >= +4  → BULLISH
-      <= -4  → BEARISH
-      else   → NEUTRAL
+    Latch rules:
+      - DSS >= +4  →  latch BULLISH (regardless of prior mode)
+      - DSS <= -4  →  latch BEARISH (regardless of prior mode)
+      - DSS between -3 and +3  →  KEEP prior latched mode
+      - If no prior mode exists (first run), treat as NEUTRAL
 
     Args:
         highs: Array of high prices
@@ -363,6 +365,7 @@ def compute_trend_bias(
         closes: Array of close prices
         dss_params: Override DSS parameters (optional)
         lyap_params: Ignored (kept for API compatibility)
+        latched_mode: Prior latched mode ('BULLISH', 'BEARISH', or None)
 
     Returns:
         dict with:
@@ -373,6 +376,8 @@ def compute_trend_bias(
           - strength: 'STRONG', 'MODERATE', or 'WEAK'
           - can_break_above: bool
           - can_break_below: bool
+          - latched: bool (True if mode was carried from prior session)
+          - trigger: str ('new_trigger', 'latched', or 'no_latch')
     """
     # DSS Bressert only
     dss = DSSBressert(**(dss_params or {}))
@@ -383,13 +388,27 @@ def compute_trend_bias(
     lyap_signal = 0
     combined = dss_signal
 
-    # Determine bias (DSS-only thresholds)
+    # Determine bias with latching
+    latched = False
+    trigger = 'no_latch'
+
     if combined >= 4:
+        # Fresh BUY trigger — latch BULLISH
         bias = 'BULLISH'
+        trigger = 'new_trigger'
     elif combined <= -4:
+        # Fresh SELL trigger — latch BEARISH
         bias = 'BEARISH'
+        trigger = 'new_trigger'
+    elif latched_mode in ('BULLISH', 'BEARISH'):
+        # No new trigger — keep prior latched mode
+        bias = latched_mode
+        latched = True
+        trigger = 'latched'
     else:
+        # No prior mode and no trigger — truly neutral (first run)
         bias = 'NEUTRAL'
+        trigger = 'no_latch'
 
     # Determine strength
     abs_combined = abs(combined)
@@ -414,4 +433,6 @@ def compute_trend_bias(
         'dss_last': dss.dss_values[-1] if dss.dss_values else 50,
         'dss_signal_line': dss.signal_values[-1] if dss.signal_values else 50,
         'lyap_last': 0,
+        'latched': latched,
+        'trigger': trigger,
     }

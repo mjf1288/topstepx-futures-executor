@@ -1,41 +1,49 @@
 {
   "instruments": {
     "MNQ": {
-      "mode": "NEUTRAL",
-      "regime": "NEUTRAL",
+      "mode": "SELL",
+      "regime": "BEARISH",
       "strength": "WEAK",
       "dss_signal": -1,
-      "lyap_signal": -4,
-      "combined_signal": -5,
-      "computed_at": "2026-03-13T19:44:02.609006-04:00"
+      "lyap_signal": 0,
+      "combined_signal": -1,
+      "latched": true,
+      "trigger": "latched",
+      "computed_at": "2026-03-27T01:08:58.322246-04:00"
     },
     "MES": {
-      "mode": "NEUTRAL",
-      "regime": "NEUTRAL",
+      "mode": "SELL",
+      "regime": "BEARISH",
       "strength": "WEAK",
       "dss_signal": -1,
-      "lyap_signal": -4,
-      "combined_signal": -5,
-      "computed_at": "2026-03-13T19:44:02.609006-04:00"
+      "lyap_signal": 0,
+      "combined_signal": -1,
+      "latched": true,
+      "trigger": "latched",
+      "computed_at": "2026-03-27T01:08:58.322246-04:00"
     },
     "MYM": {
-      "mode": "NEUTRAL",
-      "regime": "NEUTRAL",
+      "mode": "SELL",
+      "regime": "BEARISH",
       "strength": "WEAK",
       "dss_signal": -1,
-      "lyap_signal": -4,
-      "combined_signal": -5,
-      "computed_at": "2026-03-13T19:44:02.609006-04:00"
+      "lyap_signal": 0,
+      "combined_signal": -1,
+      "latched": true,
+      "trigger": "latched",
+      "computed_at": "2026-03-27T01:08:58.322246-04:00"
     },
     "M2K": {
-      "mode": "NEUTRAL",
-      "regime": "NEUTRAL",
+      "mode": "SELL",
+      "regime": "BEARISH",
       "strength": "WEAK",
       "dss_signal": -1,
-      "lyap_signal": -4,
-      "combined_signal": -5,
-      "computed_at": "2026-03-13T19:44:02.609006-04:00"
+      "lyap_signal": 0,
+      "combined_signal": -1,
+      "latched": true,
+      "trigger": "latched",
+      "computed_at": "2026-03-27T01:08:58.322246-04:00"
     }
   },
-  "last_updated": "2026-03-13T19:44:02.609006-04:00"
+  "last_updated": "2026-03-27T01:08:58.322246-04:00"
 }

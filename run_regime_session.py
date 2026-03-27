@@ -6,8 +6,14 @@ Single unified pipeline that runs 3x/day at each 8h bar close:
   - 10:00 AM ET (morning bar closes)
   - 6:00 PM ET  (RTH bar closes)
 
+v5.0 LATCHING MODE:
+  DSS regime now latches — once a BUY or SELL trigger fires (DSS >= +4
+  or <= -4), that mode persists across all subsequent sessions until an
+  opposite trigger fires.  Continuation values (+1 to +3) keep the bias
+  alive, giving more chances for mean level entries.
+
 Each run:
-  1. Fetch 8h bars, compute DSS Bressert + Lyapunov HP → BUY / SELL / NEUTRAL
+  1. Fetch 8h bars, compute DSS Bressert → BUY / SELL (latched)
   2. Fetch 5-min + daily bars, compute mean levels (CDM, PDM, CMM, PMM)
   3. Cancel any stale pending limit orders from prior session
   4. If regime is BUY or SELL, place LIMIT orders at mean levels:
@@ -476,7 +482,13 @@ async def run_regime_session(
             if kept:
                 print(f"  Retained {kept} bracket(s) for open positions.")
 
-        # ── Step 2: Compute regime + levels for each symbol ──
+        # ── Step 2: Load prior latched regime state ──
+        prior_regime = {}
+        if os.path.exists(REGIME_FILE):
+            with open(REGIME_FILE, "r") as f:
+                prior_regime = json.load(f).get("instruments", {})
+
+        # ── Step 3: Compute regime + levels for each symbol ──
         print(f"\n  ── SCANNING ──")
 
         for symbol in symbols:
@@ -501,8 +513,15 @@ async def run_regime_session(
                 lows_8h = bars_8h["low"].to_list()
                 closes_8h = bars_8h["close"].to_list()
 
-                # Compute regime
-                bias = compute_trend_bias(highs_8h, lows_8h, closes_8h)
+                # Get prior latched mode for this symbol
+                prior_sym = prior_regime.get(symbol, {})
+                latched_mode = prior_sym.get("regime")  # 'BULLISH', 'BEARISH', or None
+
+                # Compute regime with latching
+                bias = compute_trend_bias(
+                    highs_8h, lows_8h, closes_8h,
+                    latched_mode=latched_mode,
+                )
                 if bias["bias"] == "BULLISH":
                     mode = "BUY"
                 elif bias["bias"] == "BEARISH":
@@ -511,7 +530,13 @@ async def run_regime_session(
                     mode = "NEUTRAL"
 
                 mode_icon = {"BUY": "▲", "SELL": "▼", "NEUTRAL": "●"}[mode]
-                print(f"  [{symbol}] Regime: {mode_icon} {mode} "
+                latch_tag = ""
+                if bias.get("latched"):
+                    latch_tag = " [LATCHED]"
+                elif bias.get("trigger") == "new_trigger":
+                    latch_tag = " [NEW TRIGGER]"
+
+                print(f"  [{symbol}] Regime: {mode_icon} {mode}{latch_tag} "
                       f"(DSS={bias['dss_signal']:+d} Lyap={bias['lyap_signal']:+d} "
                       f"Combined={bias['combined_signal']:+d})")
 
@@ -522,6 +547,8 @@ async def run_regime_session(
                     "dss_signal": bias["dss_signal"],
                     "lyap_signal": bias["lyap_signal"],
                     "combined_signal": bias["combined_signal"],
+                    "latched": bias.get("latched", False),
+                    "trigger": bias.get("trigger", "no_latch"),
                     "computed_at": now.isoformat(),
                 }
 
