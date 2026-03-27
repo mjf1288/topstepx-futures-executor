@@ -751,8 +751,9 @@ async def run_regime_session(
                             "dist_pct": round(abs(current_price - entry) / current_price * 100, 2),
                         })
 
-                # Sort by strength (monthly first)
-                candidates.sort(key=lambda x: x["strength"], reverse=True)
+                # Sort by distance (closest to price first)
+                # In a trend, CDM/PDM are tight resistance/support entries
+                candidates.sort(key=lambda x: x["dist_pct"])
 
                 if not candidates:
                     print(f"  [{symbol}] No eligible levels for {mode} mode")
@@ -760,7 +761,7 @@ async def run_regime_session(
                                         "action": "no_eligible_levels"})
                     continue
 
-                # Pick the strongest level
+                # Pick the closest level to price
                 best = candidates[0]
 
                 # Check existing positions (raw API to avoid SDK model drift)
