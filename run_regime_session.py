@@ -611,32 +611,23 @@ async def run_regime_session(
                 atr = compute_atr(daily_bars, period=14)
 
                 # Dynamic ATR multiplier: scale stop to fit MLL cushion
-                # if needed, but never go below MIN_ATR_MULTIPLIER
+                # if possible, but NEVER BLOCK — either recover or hit MLL and reset
                 usable_cushion = cushion - MLL_CUSHION_BUFFER
                 dollar_per_point = tick_value / tick_size
                 full_stop_risk = atr * atr_mult * dollar_per_point
                 effective_mult = atr_mult
 
-                if full_stop_risk > usable_cushion and usable_cushion > 0:
+                if usable_cushion > 0 and full_stop_risk > usable_cushion:
                     # Scale down multiplier to fit
                     fitted_mult = usable_cushion / (atr * dollar_per_point)
-                    if fitted_mult >= MIN_ATR_MULTIPLIER:
-                        effective_mult = round(fitted_mult, 2)
-                        print(f"    MLL TIGHT — reducing stop from {atr_mult}x to "
-                              f"{effective_mult}x ATR to fit ${usable_cushion:.0f} cushion")
-                    else:
-                        print(f"  [{symbol}] MLL BLOCK — even {MIN_ATR_MULTIPLIER}x ATR "
-                              f"(${atr * MIN_ATR_MULTIPLIER * dollar_per_point:.0f}) > "
-                              f"${usable_cushion:.0f} cushion")
-                        all_results.append({"symbol": symbol, "regime": regime_data,
-                                            "action": "mll_blocked",
-                                            "dollar_risk": full_stop_risk})
-                        continue
+                    effective_mult = max(round(fitted_mult, 2), MIN_ATR_MULTIPLIER)
+                    print(f"    MLL TIGHT — reducing stop from {atr_mult}x to "
+                          f"{effective_mult}x ATR (cushion ${usable_cushion:.0f})")
                 elif usable_cushion <= 0:
-                    print(f"  [{symbol}] MLL BLOCK — no usable cushion")
-                    all_results.append({"symbol": symbol, "regime": regime_data,
-                                        "action": "mll_blocked", "dollar_risk": full_stop_risk})
-                    continue
+                    # No cushion at all — use minimum ATR, accept the risk
+                    effective_mult = MIN_ATR_MULTIPLIER
+                    print(f"    MLL WARNING — no cushion, using floor {MIN_ATR_MULTIPLIER}x ATR")
+                # NOTE: MLL block removed per user directive — trade through it
 
                 stop_dist = atr * effective_mult
                 stop_dist = max(stop_dist, tick_size * 4)
