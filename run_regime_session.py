@@ -289,6 +289,32 @@ def save_orders(state: dict):
         json.dump(state, f, indent=2)
 
 
+async def _get_positioned_symbols(client) -> tuple[set, int]:
+    """Get symbols with open positions via raw API (avoids SDK model issues)."""
+    import aiohttp
+    token = client.get_session_token()
+    base_url = client.base_url
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    account = client.get_account_info()
+    positioned = set()
+    total_lots = 0
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f'{base_url}/Position/searchOpen',
+                                 json={'accountId': account.id},
+                                 headers=headers) as resp:
+                data = await resp.json()
+                for p in data.get('positions', []):
+                    cid = p.get('contractId', '')
+                    parts = cid.split('.')
+                    sym = parts[3] if len(parts) >= 4 else cid
+                    positioned.add(sym)
+                    total_lots += p.get('size', 1)
+    except Exception as e:
+        print(f"  WARNING: Position check failed: {e}")
+    return positioned, total_lots
+
+
 async def cancel_all_pending(client, orders_state: dict) -> int:
     """Cancel stale UNFILLED limit entries (+ their brackets) from prior session.
     
@@ -309,13 +335,7 @@ async def cancel_all_pending(client, orders_state: dict) -> int:
     kept = 0
 
     # Get open positions to check which entries have filled
-    open_positions = await client.search_open_positions()
-    positioned_symbols = set()
-    for p in open_positions:
-        cid = getattr(p, 'contractId', '')
-        parts = cid.split('.')
-        sym = parts[3] if len(parts) >= 4 else cid
-        positioned_symbols.add(sym)
+    positioned_symbols, _ = await _get_positioned_symbols(client)
 
     async with aiohttp.ClientSession() as http:
         for key, info in list(pending.items()):
@@ -689,16 +709,8 @@ async def run_regime_session(
                 # Pick the strongest level
                 best = candidates[0]
 
-                # Check existing positions
-                existing = await client.search_open_positions()
-                positioned_symbols = set()
-                open_lots = 0
-                for p in existing:
-                    cid = getattr(p, 'contractId', '')
-                    parts = cid.split('.')
-                    sym = parts[3] if len(parts) >= 4 else cid
-                    positioned_symbols.add(sym)
-                    open_lots += getattr(p, 'size', 1)
+                # Check existing positions (raw API to avoid SDK model drift)
+                positioned_symbols, open_lots = await _get_positioned_symbols(client)
 
                 if symbol in positioned_symbols:
                     print(f"  [{symbol}] Already has open position — skip")
@@ -763,11 +775,12 @@ async def run_regime_session(
                 traceback.print_exc()
                 all_results.append({"symbol": symbol, "action": "error", "error": str(e)})
 
-    # Save regime state
-    regime_out = {}
+    # Save regime state — preserve prior latch for symbols that errored
+    regime_out = dict(prior_regime)  # Start with prior state
     for r in all_results:
         if "regime" in r:
             regime_out[r["symbol"]] = r["regime"]
+        # If error occurred, prior state is kept (not overwritten)
     regime_state = {"instruments": regime_out, "last_updated": now.isoformat()}
     with open(REGIME_FILE, "w") as f:
         json.dump(regime_state, f, indent=2)
