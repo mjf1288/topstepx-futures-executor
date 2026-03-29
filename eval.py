@@ -376,8 +376,10 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
         
         # One session = 8 hours = 96 five-minute bars for entry fill window
         entry_window = future_5m[:96]
-        # Once filled, allow full 48h for stop/target resolution
-        full_window = future_5m[:576]
+        # Once filled, brackets stay active until stop or target is hit.
+        # In live trading, positions are held indefinitely (across sessions)
+        # until the bracket resolves. Use ALL remaining 5m data.
+        full_window = future_5m
 
         entry_filled = False
         entry_bar_idx = None
@@ -475,7 +477,9 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                     break
 
         # If trade was filled but neither stop nor target hit within
-        # the 48h window, lock position until end of the window
+        # the available 5m data, lock position until end of data.
+        # (In live trading this would eventually resolve — we just
+        # don't have enough data to see it. These are NOT counted.)
         if not trade_resolved and full_window:
             position_free_after = full_window[-1]["timestamp"]
 

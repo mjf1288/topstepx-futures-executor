@@ -170,7 +170,7 @@ for symbol in params.SYMBOLS:
         
         future_5m = [b for b in bars_5m if b["timestamp"] > current_bar["timestamp"]]
         entry_window = future_5m[:96]
-        full_window = future_5m[:576]
+        full_window = future_5m  # No time cap — match live behavior
         
         entry_filled = False
         entry_bar_idx = None
