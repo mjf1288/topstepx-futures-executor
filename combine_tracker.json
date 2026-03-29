@@ -1,0 +1,15 @@
+{
+  "starting_balance": 50000,
+  "peak_eod_balance": 50000,
+  "current_mll": 48000,
+  "mll_locked": false,
+  "total_realized_pnl": 0.0,
+  "daily_pnl": {},
+  "best_day_pnl": 0.0,
+  "trades_today": 0,
+  "today_pnl": 0.0,
+  "today_date": null,
+  "total_lots_open": 0,
+  "created": "2026-03-29T17:30:00-04:00",
+  "last_updated": "2026-03-29T21:29:50.934418"
+}
