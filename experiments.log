@@ -2,6 +2,7 @@
 # =====================================
 # Format: [exp_number] [kept/reverted] [parameter] [old_value -> new_value] [score] [notes]
 #
-# Baseline: profit_factor ~1.76, win_rate ~45.2%, ATR_MULT=1.0, RR=2.0
+# Baseline: SCORE=1.6955, profit_factor=1.6955, 19 trades (8W/11L), win_rate=42.11%, total_pnl=3209pts
+# Parameters: ATR_MULT=1.0, RR=2.0, DSS(8,4,3), OB/OS=80/20, LATCH=±4, LEVEL=closest
 #
 # --- Experiments ---

@@ -86,7 +86,7 @@ For each experiment:
 
 ## Important
 
-- **BASELINE SCORE: ~1.45 PF** (19 trades, 8W/11L, 42% WR, full dataset).
+- **BASELINE SCORE: 1.6955 PF** (19 trades, 8W/11L, 42.1% WR, 3209 PnL pts).
   Your goal is to beat this.
 - The score uses the FULL dataset (no train/val split). We only have ~2 months
   of 5-minute data and ~19 resolved trades, so splitting would be too noisy.
