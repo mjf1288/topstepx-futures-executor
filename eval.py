@@ -257,9 +257,24 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
 
     trades = []
     latched_mode = None
+    # Track open position: when we enter a trade, record the timestamp
+    # at which the position will be fully resolved (stop or target hit,
+    # or 48h window expires). Skip new entries until then.
+    position_free_after = None  # timestamp string; None = no open position
 
     # Walk through 8h bars, simulating the 3x/day session logic
     for i in range(30, len(bars_8h)):
+        current_bar = bars_8h[i]
+        bar_date = current_bar["timestamp"][:10]
+        current_price = current_bar["close"]
+
+        # ── Position lock: skip this bar if we're still in a trade ──
+        if position_free_after is not None:
+            if current_bar["timestamp"] < position_free_after:
+                continue  # still holding a position, don't open another
+            else:
+                position_free_after = None  # position resolved, free to trade
+
         # Compute DSS on the 8h bars up to this point
         h_slice = [b["high"] for b in bars_8h[:i+1]]
         l_slice = [b["low"] for b in bars_8h[:i+1]]
@@ -281,9 +296,6 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
             continue  # NEUTRAL, no trade
 
         mode = latched_mode
-        current_bar = bars_8h[i]
-        bar_date = current_bar["timestamp"][:10]
-        current_price = current_bar["close"]
 
         # Get 5m bars up to this bar's date for mean levels
         bars_5m_slice = [b for b in bars_5m if b["timestamp"][:10] <= bar_date]
@@ -356,31 +368,38 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
             target_price = entry_price - stop_dist * params.RR_RATIO
 
         # Simulate fill: look forward in 5m bars to see if entry is hit,
-        # then if stop or target is hit first
+        # then if stop or target is hit first.
+        # CRITICAL: Match live behavior — limit orders are only live for ONE
+        # session (~8 hours). If not filled within 96 five-minute bars,
+        # the order is cancelled (just like cancel_all_pending does live).
         future_5m = [b for b in bars_5m if b["timestamp"] > current_bar["timestamp"]]
         
-        # Look forward up to ~2 full sessions (576 bars = 48 hours)
-        # Mean level limit orders often take time to fill
-        future_5m = future_5m[:576]
+        # One session = 8 hours = 96 five-minute bars for entry fill window
+        entry_window = future_5m[:96]
+        # Once filled, allow full 48h for stop/target resolution
+        full_window = future_5m[:576]
 
         entry_filled = False
-        for fb in future_5m:
-            if not entry_filled:
-                # Check if entry level is reached
-                if best["side"] == "BUY" and fb["low"] <= entry_price:
-                    entry_filled = True
-                elif best["side"] == "SELL" and fb["high"] >= entry_price:
-                    entry_filled = True
-                continue
-
-            # Entry filled — check stop and target
-            # Use OHLC order to determine which was hit first:
-            #   - If open is already past stop/target, that's the exit
-            #   - Otherwise, for BUY: if bar opens closer to entry,
-            #     assume price went UP first (target check), then down (stop)
-            #   - For SELL: if bar opens closer to entry,
-            #     assume price went DOWN first (target check), then up (stop)
-            # This removes the bias of always checking stop first.
+        entry_bar_idx = None
+        
+        # Phase 1: Check entry fill within one session window
+        for idx, fb in enumerate(entry_window):
+            if best["side"] == "BUY" and fb["low"] <= entry_price:
+                entry_filled = True
+                entry_bar_idx = idx
+                break
+            elif best["side"] == "SELL" and fb["high"] >= entry_price:
+                entry_filled = True
+                entry_bar_idx = idx
+                break
+        
+        if not entry_filled:
+            continue  # Order cancelled — no fill within session
+        
+        # Phase 2: Check stop/target after fill
+        post_fill_bars = full_window[entry_bar_idx + 1:]
+        trade_resolved = False
+        for fb in post_fill_bars:
 
             hit_stop = False
             hit_target = False
@@ -390,8 +409,6 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                 hit_target = fb["high"] >= target_price
 
                 if hit_stop and hit_target:
-                    # Both hit on same bar — use open to determine order
-                    # If open is above entry (favorable), target likely hit first
                     if fb["open"] >= entry_price:
                         hit_stop = False  # Target wins
                     else:
@@ -406,6 +423,8 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "level": best["level"], "date": bar_date,
                         "result": "win", "trigger": trigger,
                     })
+                    position_free_after = fb["timestamp"]
+                    trade_resolved = True
                     break
                 elif hit_stop:
                     pnl = stop_price - entry_price
@@ -416,6 +435,8 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "level": best["level"], "date": bar_date,
                         "result": "loss", "trigger": trigger,
                     })
+                    position_free_after = fb["timestamp"]
+                    trade_resolved = True
                     break
 
             else:  # SELL
@@ -437,6 +458,8 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "level": best["level"], "date": bar_date,
                         "result": "win", "trigger": trigger,
                     })
+                    position_free_after = fb["timestamp"]
+                    trade_resolved = True
                     break
                 elif hit_stop:
                     pnl = entry_price - stop_price
@@ -447,7 +470,14 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "level": best["level"], "date": bar_date,
                         "result": "loss", "trigger": trigger,
                     })
+                    position_free_after = fb["timestamp"]
+                    trade_resolved = True
                     break
+
+        # If trade was filled but neither stop nor target hit within
+        # the 48h window, lock position until end of the window
+        if not trade_resolved and full_window:
+            position_free_after = full_window[-1]["timestamp"]
 
     return trades
 
@@ -556,7 +586,9 @@ def main():
 
         # Full backtest (no date filter) to see total capacity
         all_trades = backtest_symbol(symbol, data)
-        print(f"  [{symbol}] Total trades (unfiltered): {len(all_trades)}", file=sys.stderr)
+        sym_wins = sum(1 for t in all_trades if t["result"] == "win")
+        sym_losses = len(all_trades) - sym_wins
+        print(f"  [{symbol}] Total trades: {len(all_trades)} (W:{sym_wins} L:{sym_losses})", file=sys.stderr)
 
         # Training set: everything before split date
         train_trades = [t for t in all_trades if t["date"] < SPLIT_DATE]
