@@ -374,20 +374,30 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                 continue
 
             # Entry filled — check stop and target
+            # Use OHLC order to determine which was hit first:
+            #   - If open is already past stop/target, that's the exit
+            #   - Otherwise, for BUY: if bar opens closer to entry,
+            #     assume price went UP first (target check), then down (stop)
+            #   - For SELL: if bar opens closer to entry,
+            #     assume price went DOWN first (target check), then up (stop)
+            # This removes the bias of always checking stop first.
+
+            hit_stop = False
+            hit_target = False
+
             if best["side"] == "BUY":
-                if fb["low"] <= stop_price:
-                    # Stopped out
-                    pnl = stop_price - entry_price
-                    trades.append({
-                        "symbol": symbol, "side": best["side"],
-                        "entry": entry_price, "exit": stop_price,
-                        "pnl_points": round(pnl, 4),
-                        "level": best["level"], "date": bar_date,
-                        "result": "loss", "trigger": trigger,
-                    })
-                    break
-                elif fb["high"] >= target_price:
-                    # Target hit
+                hit_stop = fb["low"] <= stop_price
+                hit_target = fb["high"] >= target_price
+
+                if hit_stop and hit_target:
+                    # Both hit on same bar — use open to determine order
+                    # If open is above entry (favorable), target likely hit first
+                    if fb["open"] >= entry_price:
+                        hit_stop = False  # Target wins
+                    else:
+                        hit_target = False  # Stop wins
+
+                if hit_target:
                     pnl = target_price - entry_price
                     trades.append({
                         "symbol": symbol, "side": best["side"],
@@ -397,9 +407,8 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "result": "win", "trigger": trigger,
                     })
                     break
-            else:  # SELL
-                if fb["high"] >= stop_price:
-                    pnl = entry_price - stop_price
+                elif hit_stop:
+                    pnl = stop_price - entry_price
                     trades.append({
                         "symbol": symbol, "side": best["side"],
                         "entry": entry_price, "exit": stop_price,
@@ -408,7 +417,18 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "result": "loss", "trigger": trigger,
                     })
                     break
-                elif fb["low"] <= target_price:
+
+            else:  # SELL
+                hit_stop = fb["high"] >= stop_price
+                hit_target = fb["low"] <= target_price
+
+                if hit_stop and hit_target:
+                    if fb["open"] <= entry_price:
+                        hit_stop = False  # Target wins
+                    else:
+                        hit_target = False  # Stop wins
+
+                if hit_target:
                     pnl = entry_price - target_price
                     trades.append({
                         "symbol": symbol, "side": best["side"],
@@ -416,6 +436,16 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                         "pnl_points": round(pnl, 4),
                         "level": best["level"], "date": bar_date,
                         "result": "win", "trigger": trigger,
+                    })
+                    break
+                elif hit_stop:
+                    pnl = entry_price - stop_price
+                    trades.append({
+                        "symbol": symbol, "side": best["side"],
+                        "entry": entry_price, "exit": stop_price,
+                        "pnl_points": round(pnl, 4),
+                        "level": best["level"], "date": bar_date,
+                        "result": "loss", "trigger": trigger,
                     })
                     break
 
