@@ -81,14 +81,18 @@ For each experiment:
 - `SCORE: 0.5–0.9` — Losing strategy. Revert.
 - `SCORE: 1.0` — Breakeven. Not useful.
 - `SCORE: 1.0–1.5` — Slightly profitable. Baseline territory.
-- `SCORE: 1.5–2.0` — Good. The current v5.0 baseline is ~1.76.
+- `SCORE: 1.5–2.0` — Good. This is the target range.
 - `SCORE: 2.0+` — Excellent. But verify the trade count isn't suspiciously low.
 
 ## Important
 
-- The baseline v5.0 achieves a ~1.76 profit factor. Your goal is to beat this.
+- **BASELINE SCORE: ~1.45 PF** (19 trades, 8W/11L, 42% WR, full dataset).
+  Your goal is to beat this.
+- The score uses the FULL dataset (no train/val split). We only have ~2 months
+  of 5-minute data and ~19 resolved trades, so splitting would be too noisy.
 - If you're stuck after 5 consecutive reverts, try a completely different parameter.
-- Watch for overfitting: if training PF is 3.0 but validation PF is 1.2, the parameters
-  are likely overfit to the training set. Prefer changes that improve BOTH sets.
-- After every 10 experiments, run `python eval.py` (without --val-only) to see the
-  full training vs validation breakdown. Note any divergence.
+- Watch for trade count dropping: if a parameter change drops below 15 trades,
+  it's probably filtering too aggressively. Prefer changes that maintain or increase
+  trade count while improving PF.
+- After every 10 experiments, run `python eval.py` (full output) to review
+  per-symbol breakdown and overall statistics.

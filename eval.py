@@ -563,13 +563,6 @@ def main():
 
     val_only = "--val-only" in sys.argv
 
-    # Date split configuration
-    # Training:   everything before SPLIT_DATE
-    # Validation: SPLIT_DATE through end of data
-    # Using March 1 as split — gives ~2 months training (Jan–Feb) and
-    # ~1 month validation (March), matching the 5m data availability.
-    SPLIT_DATE = "2026-03-01"  # Train: Jan-Feb, Validate: March
-
     symbols = params.SYMBOLS
 
     # Check for data
@@ -580,8 +573,7 @@ def main():
         print("SCORE: 0.0")
         sys.exit(1)
 
-    all_train_trades = []
-    all_val_trades = []
+    all_trades = []
 
     for symbol in symbols:
         data = load_bar_data(symbol)
@@ -596,55 +588,45 @@ def main():
                 last = bars[-1]["timestamp"][:10]
                 print(f"  [{symbol}] {tf}: {len(bars)} bars ({first} to {last})", file=sys.stderr)
 
-        # Full backtest (no date filter) to see total capacity
-        all_trades = backtest_symbol(symbol, data)
-        sym_wins = sum(1 for t in all_trades if t["result"] == "win")
-        sym_losses = len(all_trades) - sym_wins
-        print(f"  [{symbol}] Total trades: {len(all_trades)} (W:{sym_wins} L:{sym_losses})", file=sys.stderr)
+        # Full backtest (no date filter)
+        sym_trades = backtest_symbol(symbol, data)
+        sym_wins = sum(1 for t in sym_trades if t["result"] == "win")
+        sym_losses = len(sym_trades) - sym_wins
+        print(f"  [{symbol}] Total trades: {len(sym_trades)} (W:{sym_wins} L:{sym_losses})", file=sys.stderr)
+        all_trades.extend(sym_trades)
 
-        # Training set: everything before split date
-        train_trades = [t for t in all_trades if t["date"] < SPLIT_DATE]
-        all_train_trades.extend(train_trades)
-
-        # Validation set: split date through end
-        val_trades = [t for t in all_trades if t["date"] >= SPLIT_DATE]
-        all_val_trades.extend(val_trades)
-
-    train_score = compute_score(all_train_trades)
-    val_score = compute_score(all_val_trades)
+    full_score = compute_score(all_trades)
 
     if not val_only:
         print("=" * 50, file=sys.stderr)
-        print("  BACKTEST RESULTS", file=sys.stderr)
+        print("  BACKTEST RESULTS (full dataset)", file=sys.stderr)
         print("=" * 50, file=sys.stderr)
-        print(f"\n  TRAINING SET (before {SPLIT_DATE}):", file=sys.stderr)
-        print(f"    Trades:        {train_score['total_trades']}", file=sys.stderr)
-        print(f"    Profit Factor: {train_score['profit_factor']}", file=sys.stderr)
-        print(f"    Win Rate:      {train_score['win_rate']}%", file=sys.stderr)
-        print(f"    Avg R:         {train_score['avg_r']}", file=sys.stderr)
-        print(f"    Max Consec L:  {train_score['max_consec_losses']}", file=sys.stderr)
-        print(f"\n  VALIDATION SET (from {SPLIT_DATE}):", file=sys.stderr)
-        print(f"    Trades:        {val_score['total_trades']}", file=sys.stderr)
-        print(f"    Profit Factor: {val_score['profit_factor']}", file=sys.stderr)
-        print(f"    Win Rate:      {val_score['win_rate']}%", file=sys.stderr)
-        print(f"    Avg R:         {val_score['avg_r']}", file=sys.stderr)
-        print(f"    Max Consec L:  {val_score['max_consec_losses']}", file=sys.stderr)
+        print(f"    Trades:        {full_score['total_trades']}", file=sys.stderr)
+        print(f"    Wins:          {full_score['wins']}", file=sys.stderr)
+        print(f"    Losses:        {full_score['losses']}", file=sys.stderr)
+        print(f"    Profit Factor: {full_score['profit_factor']}", file=sys.stderr)
+        print(f"    Win Rate:      {full_score['win_rate']}%", file=sys.stderr)
+        print(f"    Avg R:         {full_score['avg_r']}", file=sys.stderr)
+        print(f"    Total PnL pts: {full_score['total_pnl_points']}", file=sys.stderr)
+        print(f"    Max Consec L:  {full_score['max_consec_losses']}", file=sys.stderr)
         print("=" * 50, file=sys.stderr)
 
     # THE SINGLE SCORE — this is what the ratchet reads
-    # Using validation profit factor as the primary metric
-    score = val_score["profit_factor"]
+    # Using full-dataset profit factor as the primary metric.
+    # (No train/val split — only 19 trades over 2 months of 5m data;
+    #  splitting gives too few trades per set for stable optimization.)
+    score = full_score["profit_factor"]
 
     # Penalize if too few trades (not statistically meaningful)
-    if val_score["total_trades"] < 10:
+    if full_score["total_trades"] < 10:
         score *= 0.5  # Halve the score if under 10 trades
-        print(f"  WARNING: Only {val_score['total_trades']} validation trades — "
+        print(f"  WARNING: Only {full_score['total_trades']} trades — "
               f"score penalized", file=sys.stderr)
 
     # Penalize extreme max consecutive losses (risk of ruin)
-    if val_score["max_consec_losses"] > 8:
+    if full_score["max_consec_losses"] > 8:
         score *= 0.8
-        print(f"  WARNING: {val_score['max_consec_losses']} consecutive losses — "
+        print(f"  WARNING: {full_score['max_consec_losses']} consecutive losses — "
               f"score penalized", file=sys.stderr)
 
     print(f"SCORE: {score:.4f}")

@@ -8,10 +8,11 @@ An autoresearch loop is being run to optimize strategy parameters.
 1. **ONLY modify `strategy_params.py`** — never touch eval.py, program.md, or any other .py file
 2. Read `program.md` for full research directions before starting
 3. Log every experiment to `experiments.log`
-4. Run `python eval.py --val-only` to score each change
+4. Run `python eval.py --val-only` to score each change (outputs only the SCORE line)
 5. Parse the `SCORE: X.XXXX` line from stdout to get the score
-6. ONE parameter change per experiment — never change multiple at once
-7. git commit on improvements, git checkout on failures
+6. The score is the full-dataset profit factor (no train/val split)
+7. ONE parameter change per experiment — never change multiple at once
+8. git commit on improvements, git checkout on failures
 
 ## Quick Start
 ```bash
