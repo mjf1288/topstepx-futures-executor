@@ -359,8 +359,9 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
         # then if stop or target is hit first
         future_5m = [b for b in bars_5m if b["timestamp"] > current_bar["timestamp"]]
         
-        # Limit forward look to ~2 sessions (48 bars * 5min = 4 hours)
-        future_5m = future_5m[:96]
+        # Look forward up to ~2 full sessions (576 bars = 48 hours)
+        # Mean level limit orders often take time to fill
+        future_5m = future_5m[:576]
 
         entry_filled = False
         for fb in future_5m:
@@ -491,10 +492,11 @@ def main():
     val_only = "--val-only" in sys.argv
 
     # Date split configuration
-    # EDIT THESE DATES to match your data range:
-    #   Training:   everything before SPLIT_DATE
-    #   Validation: SPLIT_DATE through end of data
-    SPLIT_DATE = "2026-01-01"  # Adjust based on your data
+    # Training:   everything before SPLIT_DATE
+    # Validation: SPLIT_DATE through end of data
+    # Using March 1 as split — gives ~2 months training (Jan–Feb) and
+    # ~1 month validation (March), matching the 5m data availability.
+    SPLIT_DATE = "2026-03-01"  # Train: Jan-Feb, Validate: March
 
     symbols = params.SYMBOLS
 
@@ -515,12 +517,23 @@ def main():
             print(f"  [{symbol}] No data found, skipping", file=sys.stderr)
             continue
 
+        # Show data range
+        for tf, bars in data.items():
+            if bars:
+                first = bars[0]["timestamp"][:10]
+                last = bars[-1]["timestamp"][:10]
+                print(f"  [{symbol}] {tf}: {len(bars)} bars ({first} to {last})", file=sys.stderr)
+
+        # Full backtest (no date filter) to see total capacity
+        all_trades = backtest_symbol(symbol, data)
+        print(f"  [{symbol}] Total trades (unfiltered): {len(all_trades)}", file=sys.stderr)
+
         # Training set: everything before split date
-        train_trades = backtest_symbol(symbol, data, end_date=SPLIT_DATE)
+        train_trades = [t for t in all_trades if t["date"] < SPLIT_DATE]
         all_train_trades.extend(train_trades)
 
         # Validation set: split date through end
-        val_trades = backtest_symbol(symbol, data, start_date=SPLIT_DATE)
+        val_trades = [t for t in all_trades if t["date"] >= SPLIT_DATE]
         all_val_trades.extend(val_trades)
 
     train_score = compute_score(all_train_trades)
