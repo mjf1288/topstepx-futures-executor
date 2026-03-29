@@ -376,10 +376,6 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
         
         # One session = 8 hours = 96 five-minute bars for entry fill window
         entry_window = future_5m[:96]
-        # Once filled, brackets stay active until stop or target is hit.
-        # In live trading, positions are held indefinitely (across sessions)
-        # until the bracket resolves. Use ALL remaining 5m data.
-        full_window = future_5m
 
         entry_filled = False
         entry_bar_idx = None
@@ -398,10 +394,24 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
         if not entry_filled:
             continue  # Order cancelled — no fill within session
         
-        # Phase 2: Check stop/target after fill
-        post_fill_bars = full_window[entry_bar_idx + 1:]
+        fill_timestamp = entry_window[entry_bar_idx]["timestamp"]
+
+        # Phase 2: Check stop/target after fill.
+        # In live trading, brackets stay active indefinitely until hit.
+        # Use 5m bars first (precise), then fall back to 8h bars
+        # (coarser but covers 6 months) if 5m data runs out.
+        post_fill_5m = [b for b in future_5m if b["timestamp"] > fill_timestamp]
+        post_fill_8h = [b for b in bars_8h if b["timestamp"] > fill_timestamp]
+        # Combine: 5m bars first, then 8h bars that come after the last 5m bar
+        if post_fill_5m:
+            last_5m_ts = post_fill_5m[-1]["timestamp"]
+            extra_8h = [b for b in post_fill_8h if b["timestamp"] > last_5m_ts]
+            resolution_bars = post_fill_5m + extra_8h
+        else:
+            resolution_bars = post_fill_8h
+
         trade_resolved = False
-        for fb in post_fill_bars:
+        for fb in resolution_bars:
 
             hit_stop = False
             hit_target = False
@@ -477,11 +487,9 @@ def backtest_symbol(symbol: str, data: dict, start_date: str = None,
                     break
 
         # If trade was filled but neither stop nor target hit within
-        # the available 5m data, lock position until end of data.
-        # (In live trading this would eventually resolve — we just
-        # don't have enough data to see it. These are NOT counted.)
-        if not trade_resolved and full_window:
-            position_free_after = full_window[-1]["timestamp"]
+        # ALL available data, lock position until end of data.
+        if not trade_resolved and resolution_bars:
+            position_free_after = resolution_bars[-1]["timestamp"]
 
     return trades
 
