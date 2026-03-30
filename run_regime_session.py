@@ -531,20 +531,14 @@ async def run_regime_session(
     now = datetime.now(tz)
     mode_str = "LIVE" if live else "DRY RUN"
 
-    # Time filter: only place NEW orders after 9 PM ET.
-    # The 6 PM session is at the futures day roll — CDM has no data yet.
-    # The 2 AM and 10 AM sessions have hours of volume behind the CDM.
-    # Still run regime scan + bracket management, just skip new entries.
+    # Time filter: skip Sunday before 10 PM ET (globex just opened, CDM empty).
+    # Sessions: 10 PM ET (globex), 1 AM ET (overnight), 9 AM ET (US open).
+    # All 3 sessions have meaningful CDM data behind them.
     skip_new_entries = False
-    if live and now.hour < 21:  # Before 9 PM ET
-        if now.weekday() == 6:  # Sunday
-            print(f"\n  SUNDAY EARLY SESSION — skipping new entries.")
-            print(f"  CDM needs liquidity to stabilize. Next session: 2 AM Monday.")
-            return {"status": "sunday_skip"}
-        elif now.hour >= 17 and now.hour < 21:  # 5-9 PM ET (day roll window)
-            skip_new_entries = True
-            print(f"\n  ** 6 PM SESSION — regime scan only, no new entries **")
-            print(f"  ** CDM is resetting at day roll. Orders resume at 2 AM. **")
+    if live and now.weekday() == 6 and now.hour < 22:  # Sunday before 10 PM
+        print(f"\n  SUNDAY EARLY SESSION — skipping. CDM needs liquidity.")
+        print(f"  First session: 10 PM ET tonight.")
+        return {"status": "sunday_skip"}
 
     print(f"\n{'='*65}")
     print(f"  REGIME SESSION [{mode_str}]")
@@ -838,11 +832,7 @@ async def run_regime_session(
                     print(f"    Other levels: {', '.join(others)}")
 
                 # Place full bracket: entry + stop + target (always protected)
-                if skip_new_entries:
-                    print(f"    SKIPPED — 6 PM session, no new entries")
-                    all_results.append({"symbol": symbol, "regime": regime_data,
-                                        "action": "time_filter_skip", "order": best})
-                elif live:
+                if live:
                     try:
                         ids = await place_bracket_order(
                             client, account, contract_id,
