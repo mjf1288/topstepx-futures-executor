@@ -213,6 +213,7 @@ REGIME_FILE = os.path.join(SCRIPT_DIR, "regime_state.json")
 ORDERS_FILE = os.path.join(SCRIPT_DIR, "orders_state.json")
 TRACKER_FILE = os.path.join(SCRIPT_DIR, "combine_tracker.json")
 RESULTS_FILE = os.path.join(SCRIPT_DIR, "futures_scan_results.json")
+TRADE_LOG_FILE = os.path.join(SCRIPT_DIR, "trade_log.json")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -270,6 +271,71 @@ async def get_daily_pnl(client) -> float:
     except Exception as e:
         print(f"  WARNING: Daily P&L fetch failed: {e}")
         return 0.0
+
+
+# ─────────────────────────────────────────────────────────────
+# TRADE LOG — persistent equity curve tracking
+# ─────────────────────────────────────────────────────────────
+
+def load_trade_log() -> list:
+    if os.path.exists(TRADE_LOG_FILE):
+        with open(TRADE_LOG_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+
+def save_trade_log(trades: list):
+    with open(TRADE_LOG_FILE, "w") as f:
+        json.dump(trades, f, indent=2)
+
+
+def log_trade(symbol: str, side: str, entry: float, exit_price: float,
+              pnl: float, result: str, level: str, entry_time: str,
+              exit_time: str, atr_mult: float = 1.0):
+    """Append a closed trade to the persistent trade log."""
+    trades = load_trade_log()
+    running_pnl = sum(t.get('pnl', 0) for t in trades) + pnl
+    trades.append({
+        'id': len(trades) + 1,
+        'symbol': symbol,
+        'side': side,
+        'entry': entry,
+        'exit': exit_price,
+        'pnl': round(pnl, 2),
+        'result': result,  # 'TARGET', 'STOP', 'MANUAL'
+        'level': level,
+        'atr_mult': atr_mult,
+        'entry_time': entry_time,
+        'exit_time': exit_time,
+        'running_pnl': round(running_pnl, 2),
+        'trade_count': len(trades) + 1,
+    })
+    save_trade_log(trades)
+    return trades
+
+
+def get_equity_curve_status() -> dict:
+    """Check if equity curve is above or below its moving average.
+    Returns status for future equity curve trading gate."""
+    trades = load_trade_log()
+    if len(trades) < 5:
+        return {'active': False, 'reason': f'Need 5+ trades (have {len(trades)})',
+                'trade_count': len(trades), 'running_pnl': trades[-1]['running_pnl'] if trades else 0}
+
+    pnls = [t['running_pnl'] for t in trades]
+    # 10-trade simple moving average of equity
+    window = min(10, len(pnls))
+    equity_ma = sum(pnls[-window:]) / window
+    current = pnls[-1]
+
+    return {
+        'active': True,
+        'above_ma': current >= equity_ma,
+        'current_equity': current,
+        'equity_ma': round(equity_ma, 2),
+        'window': window,
+        'trade_count': len(trades),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -348,7 +414,48 @@ async def cancel_all_pending(client, orders_state: dict) -> int:
                 kept += 1
                 continue
 
-            # Entry did NOT fill (or position already closed) — cancel everything
+            # No open position for this symbol.
+            # Two cases: (a) entry never filled, or (b) entry filled and
+            # stop/target already closed the position.
+            had_bracket = info.get("stop_order_id") is not None
+
+            if had_bracket:
+                # Position was opened and closed — log the trade
+                # Check trade history to find the exit
+                try:
+                    account = client.get_account_info()
+                    async with http.post(f'{base_url}/Trade/search',
+                                         json={'accountId': account.id},
+                                         headers=headers) as resp:
+                        trade_hist = (await resp.json()).get('trades', [])
+                    # Find the exit trade for this symbol (most recent)
+                    contract_id = info.get('contract_id', '')
+                    exit_trade = None
+                    for t in reversed(trade_hist):
+                        if t.get('contractId') == contract_id and t.get('profitAndLoss') is not None:
+                            exit_trade = t
+                            break
+                    if exit_trade:
+                        pnl = (exit_trade.get('profitAndLoss', 0) or 0) - (exit_trade.get('fees', 0) or 0)
+                        exit_price = exit_trade.get('price', 0)
+                        result = 'TARGET' if pnl > 0 else 'STOP'
+                        side_str = info.get('side_str', 'SELL' if info.get('side') == 1 else 'BUY')
+                        log_trade(
+                            symbol=symbol, side=side_str,
+                            entry=info.get('entry', 0), exit_price=exit_price,
+                            pnl=round(pnl, 2), result=result,
+                            level=info.get('level', '?'),
+                            entry_time=info.get('placed_at', ''),
+                            exit_time=exit_trade.get('creationTimestamp', ''),
+                            atr_mult=info.get('atr_mult_used', 1.0),
+                        )
+                        eq_status = get_equity_curve_status()
+                        print(f"  TRADE CLOSED: {symbol} {side_str} {result} "
+                              f"P&L ${pnl:+,.0f} (running: ${eq_status.get('running_pnl', pnl):+,.0f})")
+                except Exception as e:
+                    print(f"  WARNING: Trade log failed for {symbol}: {e}")
+
+            # Cancel any remaining orders for this symbol
             for oid_key in ["entry_order_id", "stop_order_id", "target_order_id"]:
                 oid = info.get(oid_key)
                 if not oid:
@@ -584,6 +691,18 @@ async def run_regime_session(
         print(f"  Cushion:   ${cushion:,.2f}")
         if live:
             print(f"  Daily P&L: ${daily_pnl:+,.2f} (cap: ${DAILY_PROFIT_CAP:,})")
+
+        # Equity curve status
+        eq_status = get_equity_curve_status()
+        if eq_status.get('active'):
+            eq_icon = '▲' if eq_status['above_ma'] else '▼'
+            print(f"  Equity:    ${eq_status['current_equity']:+,.0f} "
+                  f"({eq_icon} {'above' if eq_status['above_ma'] else 'BELOW'} "
+                  f"MA{eq_status['window']} @ ${eq_status['equity_ma']:+,.0f}) "
+                  f"[{eq_status['trade_count']} trades]")
+        else:
+            tc = eq_status.get('trade_count', 0)
+            print(f"  Equity:    collecting data ({tc}/5 trades for MA)")
 
         # Daily profit cap check
         if live and daily_pnl >= DAILY_PROFIT_CAP:
