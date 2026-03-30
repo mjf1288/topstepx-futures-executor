@@ -369,32 +369,63 @@ async def cancel_all_pending(client, orders_state: dict) -> int:
     return cancelled
 
 
-async def place_entry_only(client, account, contract_id: str,
-                           side: int, entry_price: float) -> int:
-    """Place ONLY the limit entry order. Stop and target are added later
-    when the fill is confirmed — prevents standalone bracket orders from
-    filling independently of the entry."""
+async def place_bracket_order(client, account, contract_id: str,
+                              side: int, entry_price: float,
+                              stop_price: float, target_price: float) -> dict:
+    """Place entry limit + stop + target as a full bracket.
+
+    All 3 orders are placed immediately so positions are ALWAYS protected.
+    The cancel_all_pending function handles cleanup — if the entry hasn't
+    filled by next session, ALL 3 orders (entry + stop + target) are cancelled
+    together, preventing orphaned bracket orders.
+    """
     import aiohttp
 
     token = client.get_session_token()
     base_url = client.base_url
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
-    payload = {
-        'accountId': account.id,
-        'contractId': contract_id,
-        'type': 1,  # Limit
-        'side': side,
-        'size': 1,
-        'limitPrice': entry_price,
-    }
+    entry_id = stop_id = target_id = None
+    stop_side = 1 if side == 0 else 0
+
     async with aiohttp.ClientSession() as http:
+        # 1. LIMIT entry
+        payload = {
+            'accountId': account.id, 'contractId': contract_id,
+            'type': 1, 'side': side, 'size': 1, 'limitPrice': entry_price,
+        }
         async with http.post(f'{base_url}/Order/place', json=payload, headers=headers) as resp:
             res = await resp.json()
             if res.get('success'):
-                return res.get('orderId')
+                entry_id = res.get('orderId')
             else:
                 raise Exception(f"Entry limit failed: {res}")
+
+        # 2. STOP LOSS
+        payload = {
+            'accountId': account.id, 'contractId': contract_id,
+            'type': 4, 'side': stop_side, 'size': 1, 'stopPrice': stop_price,
+        }
+        async with http.post(f'{base_url}/Order/place', json=payload, headers=headers) as resp:
+            res = await resp.json()
+            if res.get('success'):
+                stop_id = res.get('orderId')
+            else:
+                print(f"      Stop failed: {res}")
+
+        # 3. TAKE PROFIT
+        payload = {
+            'accountId': account.id, 'contractId': contract_id,
+            'type': 1, 'side': stop_side, 'size': 1, 'limitPrice': target_price,
+        }
+        async with http.post(f'{base_url}/Order/place', json=payload, headers=headers) as resp:
+            res = await resp.json()
+            if res.get('success'):
+                target_id = res.get('orderId')
+            else:
+                print(f"      Target failed: {res}")
+
+    return {'entry_order_id': entry_id, 'stop_order_id': stop_id, 'target_order_id': target_id}
 
 
 async def check_fills_and_bracket(client, orders_state: dict) -> int:
@@ -791,22 +822,23 @@ async def run_regime_session(
                     others = [f"{c['level']}@{c['entry']}" for c in candidates[1:]]
                     print(f"    Other levels: {', '.join(others)}")
 
-                # Place ENTRY ONLY (stop + target added after fill confirmation)
+                # Place full bracket: entry + stop + target (always protected)
                 if live:
                     try:
-                        entry_id = await place_entry_only(
+                        ids = await place_bracket_order(
                             client, account, contract_id,
                             best["side"], best["entry"],
+                            best["stop"], best["target"],
                         )
-                        print(f"    ENTRY PLACED — {entry_id} @ {best['entry']}")
-                        print(f"    (bracket deferred until fill: stop {best['stop']}, target {best['target']})")
+                        print(f"    ENTRY PLACED — {ids['entry_order_id']} @ {best['entry']}")
+                        if ids['stop_order_id']:
+                            print(f"    STOP PLACED  — {ids['stop_order_id']} @ {best['stop']}")
+                        if ids['target_order_id']:
+                            print(f"    TARGET PLACED — {ids['target_order_id']} @ {best['target']}")
 
                         order_key = f"{symbol}_{best['level']}"
                         orders_state["pending_limits"][order_key] = {
-                            "entry_order_id": entry_id,
-                            "stop_order_id": None,
-                            "target_order_id": None,
-                            **best,
+                            **ids, **best,
                             "symbol": symbol, "contract_id": contract_id,
                             "placed_at": now.isoformat(),
                         }
@@ -814,7 +846,7 @@ async def run_regime_session(
 
                         all_results.append({"symbol": symbol, "regime": regime_data,
                                             "action": "limit_placed", "order": best,
-                                            "order_ids": {"entry_order_id": entry_id}})
+                                            "order_ids": ids})
                     except Exception as e:
                         print(f"    ERROR: {e}")
                         all_results.append({"symbol": symbol, "regime": regime_data,
