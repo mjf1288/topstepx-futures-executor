@@ -531,14 +531,28 @@ async def run_regime_session(
     now = datetime.now(tz)
     mode_str = "LIVE" if live else "DRY RUN"
 
-    # Time filter: skip Sunday before 10 PM ET (globex just opened, CDM empty).
-    # Sessions: 10 PM ET (globex), 1 AM ET (overnight), 9 AM ET (US open).
-    # All 3 sessions have meaningful CDM data behind them.
+    # Session schedule (all times ET):
+    #   6 PM (Sun-Thu): Regime scan + dashboard update, NO new orders
+    #                   (CDM just reset at day roll, no data behind it)
+    #   10 PM (Sun-Thu): Place orders (CDM has 4h of globex liquidity)
+    #   1 AM (Mon-Fri):  Place orders (7h of overnight volume)
+    #   9 AM (Mon-Fri):  Place orders (full overnight, strongest CDM)
+    #   Fri 6PM / Sat:   Markets closed, skip entirely
     skip_new_entries = False
-    if live and now.weekday() == 6 and now.hour < 22:  # Sunday before 10 PM
-        print(f"\n  SUNDAY EARLY SESSION — skipping. CDM needs liquidity.")
-        print(f"  First session: 10 PM ET tonight.")
-        return {"status": "sunday_skip"}
+    day = now.weekday()  # 0=Mon ... 6=Sun
+    hour = now.hour
+
+    if live:
+        # Friday after 6 PM or Saturday — markets closed
+        if (day == 4 and hour >= 18) or day == 5:
+            print(f"\n  MARKETS CLOSED — skipping.")
+            return {"status": "market_closed"}
+
+        # 6 PM session (5-9 PM ET window) — scan only, no orders
+        if 17 <= hour < 22:
+            skip_new_entries = True
+            print(f"\n  ** 6 PM SESSION — regime scan + dashboard only, no new entries **")
+            print(f"  ** CDM resetting at day roll. Orders start at 10 PM ET. **")
 
     print(f"\n{'='*65}")
     print(f"  REGIME SESSION [{mode_str}]")
@@ -832,7 +846,11 @@ async def run_regime_session(
                     print(f"    Other levels: {', '.join(others)}")
 
                 # Place full bracket: entry + stop + target (always protected)
-                if live:
+                if skip_new_entries:
+                    print(f"    SCAN ONLY — order deferred to 10 PM session")
+                    all_results.append({"symbol": symbol, "regime": regime_data,
+                                        "action": "time_filter_skip", "order": best})
+                elif live:
                     try:
                         ids = await place_bracket_order(
                             client, account, contract_id,
