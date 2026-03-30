@@ -200,7 +200,7 @@ DAILY_PROFIT_CAP = 1_400
 MAX_CONTRACTS_PER_SYMBOL = 1
 MAX_TOTAL_CONTRACTS = 4
 
-DEFAULT_ATR_MULTIPLIER = 1.0
+DEFAULT_ATR_MULTIPLIER = 1.2  # autoresearch: 1.2x gives room to avoid noise shakeouts
 DEFAULT_RR_RATIO = 2.0
 MIN_ATR_MULTIPLIER = 0.4      # Floor — never go tighter than 0.4x ATR
 MLL_CUSHION_BUFFER = 10       # Keep $10 buffer above MLL floor
@@ -682,7 +682,7 @@ async def run_regime_session(
                         pl.col("close").last(), pl.col("volume").sum(),
                     ]).sort("date")
 
-                atr = compute_atr(daily_bars, period=14)
+                atr = compute_atr(daily_bars, period=10)  # autoresearch: shorter lookback reacts faster
 
                 # Dynamic ATR multiplier: scale stop to fit MLL cushion
                 # if possible, but NEVER BLOCK — either recover or hit MLL and reset
