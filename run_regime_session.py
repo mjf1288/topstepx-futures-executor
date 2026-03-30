@@ -531,6 +531,13 @@ async def run_regime_session(
     now = datetime.now(tz)
     mode_str = "LIVE" if live else "DRY RUN"
 
+    # Skip Sunday globex open — CDM is unreliable with thin liquidity.
+    # Let the market develop; 2 AM Monday session will have solid levels.
+    if live and now.weekday() == 6 and now.hour < 21:
+        print(f"\n  SUNDAY EARLY SESSION — skipping order placement.")
+        print(f"  CDM needs liquidity to stabilize. Next session: 2 AM Monday.")
+        return {"status": "sunday_skip"}
+
     print(f"\n{'='*65}")
     print(f"  REGIME SESSION [{mode_str}]")
     print(f"  {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
