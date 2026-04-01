@@ -735,6 +735,19 @@ async def run_regime_session(
             with open(REGIME_FILE, "r") as f:
                 prior_regime = json.load(f).get("instruments", {})
 
+        # Month-boundary latch reset: on the 1st of each month, clear
+        # all latched modes to NEUTRAL. Forces DSS to fire a fresh
+        # trigger (±4) to re-engage, preventing stale latches from
+        # carrying exhausted moves into the new month.
+        ct_now = now.astimezone(pytz.timezone("America/Chicago"))
+        if ct_now.day == 1:
+            for sym_key in list(prior_regime.keys()):
+                old_regime = prior_regime[sym_key].get('regime', 'NEUTRAL')
+                if old_regime != 'NEUTRAL':
+                    prior_regime[sym_key]['regime'] = None
+                    print(f"  MONTH RESET: {sym_key} latch cleared "
+                          f"(was {old_regime}, now requires fresh trigger)")
+
         # ── Step 3: Compute regime + levels for each symbol ──
         print(f"\n  ── SCANNING ──")
 
