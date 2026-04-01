@@ -502,10 +502,23 @@ async def main(dry_run: bool = False):
             
             # Register bar callback
             async def bar_callback(event):
-                """Handle new 5-min bar events."""
+                """Handle new 5-min bar events.
+                Event structure: event.data = {
+                    'timeframe': '5min',
+                    'data': {'open': ..., 'high': ..., 'low': ..., 'close': ..., 'volume': ...},
+                    'bar_time': ...,
+                    'symbol': ...,
+                }
+                """
                 try:
-                    symbol = event.get('symbol', '')
-                    bar = event.get('bar', {})
+                    data = event.data
+                    tf = data.get('timeframe', '')
+                    if tf != '5min':
+                        return  # Only process 5-min bars
+                    
+                    symbol = data.get('symbol', '')
+                    bar = data.get('data', {})
+                    
                     if symbol in SYMBOLS and bar:
                         close = bar.get('close', bar.get('c'))
                         if close:
@@ -516,6 +529,7 @@ async def main(dry_run: bool = False):
                                 'open': bar.get('open', bar.get('o', close)),
                                 'timestamp': datetime.now(CT),
                             }
+                            print(f"  [{symbol}] 5m bar: {close:.2f} | CDM: {state.cdm.get(symbol, '?')}")
                             await on_new_bar(symbol, bar_data, client, account)
                 except Exception as e:
                     print(f"  Bar callback error: {e}")
