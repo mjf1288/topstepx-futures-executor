@@ -825,17 +825,28 @@ async def run_regime_session(
                 print(f"    CDM: {cdm}  PDM: {pdm}")
                 print(f"    CMM: {cmm}  PMM: {pmm}")
 
-                # CMM structure gate: only BUY above CMM, only SELL below CMM
-                if cmm is not None:
-                    if mode == "BUY" and current_price < cmm:
-                        print(f"  [{symbol}] CMM GATE — price {current_price} < CMM {cmm}, "
-                              f"skipping BUY (need price above monthly mean)")
+                # Structure gate: CMM or PMM depending on month maturity
+                # First 3 trading days of a new month → use PMM (prior month mean)
+                # because CMM has too few bars to be meaningful. After day 3 → CMM.
+                gate_level = cmm
+                gate_name = "CMM"
+                ct_now = now.astimezone(pytz.timezone("America/Chicago"))
+                day_of_month = ct_now.day
+                if day_of_month <= 3 and pmm is not None:
+                    gate_level = pmm
+                    gate_name = "PMM"
+                    print(f"  [{symbol}] Month start (day {day_of_month}) — using PMM as gate")
+
+                if gate_level is not None:
+                    if mode == "BUY" and current_price < gate_level:
+                        print(f"  [{symbol}] {gate_name} GATE — price {current_price} < {gate_name} {gate_level}, "
+                              f"skipping BUY (need price above {gate_name})")
                         all_results.append({"symbol": symbol, "regime": regime_data,
                                             "action": "cmm_gate_blocked"})
                         continue
-                    elif mode == "SELL" and current_price > cmm:
-                        print(f"  [{symbol}] CMM GATE — price {current_price} > CMM {cmm}, "
-                              f"skipping SELL (need price below monthly mean)")
+                    elif mode == "SELL" and current_price > gate_level:
+                        print(f"  [{symbol}] {gate_name} GATE — price {current_price} > {gate_name} {gate_level}, "
+                              f"skipping SELL (need price below {gate_name})")
                         all_results.append({"symbol": symbol, "regime": regime_data,
                                             "action": "cmm_gate_blocked"})
                         continue
