@@ -495,7 +495,10 @@ async def main(dry_run: bool = False):
             await compute_regime(client)
             
             # Initialize TradingSuite for real-time streaming
-            suite = TradingSuite(client, symbols=SYMBOLS, timeframes=["5min"])
+            suite = await TradingSuite.create(
+                instruments=SYMBOLS,
+                timeframes=["5min"],
+            )
             
             # Register bar callback
             async def bar_callback(event):
@@ -517,10 +520,9 @@ async def main(dry_run: bool = False):
                 except Exception as e:
                     print(f"  Bar callback error: {e}")
             
-            await suite.on(EventType.NEW_BAR, bar_callback)
-            await suite.connect()
+            await suite.events.on(EventType.NEW_BAR, bar_callback)
             
-            print(f"\n  📡 STREAMING LIVE — watching {', '.join(SYMBOLS)}")
+            print(f"\n  STREAMING LIVE — watching {', '.join(SYMBOLS)}")
             print(f"  CDM updates on every 5-min bar close")
             print(f"  Press Ctrl+C to stop\n")
             
@@ -534,9 +536,9 @@ async def main(dry_run: bool = False):
                     await compute_regime(client)
                 
                 # Periodic status
-                now = datetime.now(ET)
-                if now.minute == 0:  # Print status every hour
-                    print(f"\n  [{now.strftime('%H:%M')}] Status:")
+                et_now = datetime.now(ET)
+                if et_now.minute == 0:  # Print status every hour
+                    print(f"\n  [{et_now.strftime('%H:%M')}] Status:")
                     for sym in SYMBOLS:
                         cdm = state.cdm.get(sym)
                         price = state.current_price.get(sym)
