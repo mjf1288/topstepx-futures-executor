@@ -1,19 +1,16 @@
 """
 Trend Filters for Mean Levels Futures Strategy
 ================================================
-DSS Bressert (Double Smoothed Stochastic) and Lyapunov HP
-(Hodrick-Prescott + Lyapunov Divergence) filters.
+DSS Bressert (Double Smoothed Stochastic) filter.
 
-These are used to determine trend bias before executing mean level
-breaks — only take break_above when bullish, break_below when bearish.
+Used to determine trend bias before executing mean level breaks —
+only take break_above when bullish, break_below when bearish.
 
-Each filter returns a signal from -10 (strong bearish) to +10 (strong bullish).
-The combined signal determines whether a break is tradeable.
+Signal range: -10 (strong bearish) to +10 (strong bullish).
 
 Author: Matthew Foster
 """
 
-import math
 import numpy as np
 import polars as pl
 from typing import Optional
@@ -181,156 +178,6 @@ class DSSBressert:
         return 0
 
 
-# ─────────────────────────────────────────────────────────────
-# Lyapunov HP — Hodrick-Prescott + Lyapunov Divergence
-# ─────────────────────────────────────────────────────────────
-
-class LyapunovHP:
-    """
-    Hodrick-Prescott filter with Lyapunov divergence detection.
-
-    Steps:
-      1. Compute HP filter lambda from filter_period
-      2. Apply HP filter via pentadiagonal matrix solver
-      3. Compute Lyapunov divergence = log(|hpf[i] / hpf[i-1]|) * 100000
-
-    Signals:
-      - Primary buy: filter_period bars all negative → flips positive
-      - Primary sell: filter_period bars all positive → flips negative
-      - Secondary: simple zero crossing
-      - State-based: direction + magnitude of lyapunov value
-    """
-
-    def __init__(self, filter_period: int = 7, lyapunov_period: int = 525):
-        self.filter_period = filter_period
-        self.lyapunov_period = lyapunov_period
-        self.lyapunov_values = []
-        self.hpf_values = []
-
-    def _hp_filter(self, prices: list[float], lam: float) -> list[float]:
-        """
-        Hodrick-Prescott filter using scipy sparse solver.
-
-        The HP filter minimizes:
-          sum((y_t - tau_t)^2) + lambda * sum((tau_{t+1} - 2*tau_t + tau_{t-1})^2)
-
-        This is solved via: (I + lambda * K'K) * tau = y
-        where K is the second-difference matrix.
-        """
-        from scipy import sparse
-        from scipy.sparse.linalg import spsolve
-
-        n = len(prices)
-        if n < 5:
-            return prices[:]
-
-        y = np.array(prices, dtype=np.float64)
-
-        # Build second-difference matrix K (n-2 x n)
-        # K[i] = [0...0, 1, -2, 1, 0...0] with 1 at position i, -2 at i+1, 1 at i+2
-        e = np.ones(n)
-        K = sparse.diags([e[:-2], -2*e[:-2], e[:-2]], [0, 1, 2], shape=(n-2, n))
-
-        # Solve (I + lambda * K'K) * tau = y
-        I = sparse.eye(n)
-        A = I + lam * (K.T @ K)
-        tau = spsolve(A, y)
-
-        return tau.tolist()
-
-    def calculate(self, prices: list[float]) -> dict:
-        """
-        Calculate Lyapunov HP from close prices.
-
-        Args:
-            prices: Array of close prices
-
-        Returns:
-            dict with 'hpf', 'lyapunov' arrays and latest values
-        """
-        n = len(prices)
-        if n < max(self.filter_period + 2, 10):
-            return {'hpf': [], 'lyapunov': [], 'lyap_last': 0}
-
-        # Lambda for HP filter
-        sin_val = math.sin(math.pi / self.filter_period)
-        if sin_val == 0:
-            lam = 1.0
-        else:
-            lam = 0.0625 / (sin_val ** 4)
-
-        # Apply HP filter
-        hpf = self._hp_filter(prices, lam)
-        self.hpf_values = hpf
-
-        # Lyapunov divergence
-        lyapunov = [0.0]
-        for i in range(1, len(hpf)):
-            if abs(hpf[i - 1]) < 1e-12:
-                lyapunov.append(0.0)
-            else:
-                ratio = abs(hpf[i] / hpf[i - 1])
-                if ratio > 0:
-                    lyapunov.append(math.log(ratio) * 100000)
-                else:
-                    lyapunov.append(0.0)
-
-        self.lyapunov_values = lyapunov
-
-        return {
-            'hpf': hpf,
-            'lyapunov': lyapunov,
-            'lyap_last': lyapunov[-1] if lyapunov else 0,
-        }
-
-    def get_signal(self) -> int:
-        """
-        Get the current Lyapunov signal from -10 to +10.
-
-        Returns:
-            int: Signal strength (-10 strong bearish to +10 strong bullish)
-        """
-        lyap = self.lyapunov_values
-        n = len(lyap)
-        fp = self.filter_period
-
-        if n < fp + 1:
-            return 0
-
-        current = lyap[-1]
-        recent = lyap[-(fp + 1):-1]  # Previous filter_period values
-
-        # Primary buy: all recent values negative, current flips positive
-        if all(v < 0 for v in recent) and current > 0:
-            return 10
-
-        # Primary sell: all recent values positive, current flips negative
-        if all(v > 0 for v in recent) and current < 0:
-            return -10
-
-        # Secondary: simple zero crossing
-        if len(lyap) >= 2:
-            prev = lyap[-2]
-            if prev <= 0 and current > 0:
-                return 6
-            if prev >= 0 and current < 0:
-                return -6
-
-        # State-based: direction + magnitude
-        if current > 0:
-            # Positive and increasing
-            if len(lyap) >= 2 and current > lyap[-2]:
-                return min(4, max(1, int(abs(current) / 50)))
-            else:
-                return min(2, max(1, int(abs(current) / 100)))
-        elif current < 0:
-            if len(lyap) >= 2 and current < lyap[-2]:
-                return -min(4, max(1, int(abs(current) / 50)))
-            else:
-                return -min(2, max(1, int(abs(current) / 100)))
-
-        return 0
-
 
 # ─────────────────────────────────────────────────────────────
 # Combined Trend Filter
@@ -341,7 +188,6 @@ def compute_trend_bias(
     lows: list[float],
     closes: list[float],
     dss_params: dict = None,
-    lyap_params: dict = None,
     latched_mode: str = None,
 ) -> dict:
     """
@@ -364,13 +210,11 @@ def compute_trend_bias(
         lows: Array of low prices
         closes: Array of close prices
         dss_params: Override DSS parameters (optional)
-        lyap_params: Ignored (kept for API compatibility)
         latched_mode: Prior latched mode ('BULLISH', 'BEARISH', or None)
 
     Returns:
         dict with:
           - dss_signal: int (-10 to +10)
-          - lyap_signal: int (always 0, kept for compatibility)
           - combined_signal: int (same as dss_signal)
           - bias: 'BULLISH', 'BEARISH', or 'NEUTRAL'
           - strength: 'STRONG', 'MODERATE', or 'WEAK'
@@ -379,13 +223,10 @@ def compute_trend_bias(
           - latched: bool (True if mode was carried from prior session)
           - trigger: str ('new_trigger', 'latched', or 'no_latch')
     """
-    # DSS Bressert only
+    # DSS Bressert
     dss = DSSBressert(**(dss_params or {}))
     dss.calculate(highs, lows, closes)
     dss_signal = dss.get_signal()
-
-    # Lyapunov removed — zero out for log compatibility
-    lyap_signal = 0
     combined = dss_signal
 
     # Determine bias with latching
@@ -424,7 +265,6 @@ def compute_trend_bias(
 
     return {
         'dss_signal': dss_signal,
-        'lyap_signal': lyap_signal,
         'combined_signal': combined,
         'bias': bias,
         'strength': strength,
@@ -432,7 +272,6 @@ def compute_trend_bias(
         'can_break_below': can_break_below,
         'dss_last': dss.dss_values[-1] if dss.dss_values else 50,
         'dss_signal_line': dss.signal_values[-1] if dss.signal_values else 50,
-        'lyap_last': 0,
         'latched': latched,
         'trigger': trigger,
     }

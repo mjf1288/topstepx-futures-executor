@@ -190,7 +190,7 @@ async def fetch_bars_with_rollstitch(
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
-DEFAULT_SYMBOLS = ["MNQ", "MES", "MYM"]  # M2K removed — drag on strategy (0.97 PF)
+DEFAULT_SYMBOLS = ["MNQ", "MES", "MYM"]  # Active instruments
 
 COMBINE_STARTING_BALANCE = 50_000
 COMBINE_MLL = 2_000
@@ -797,15 +797,13 @@ async def run_regime_session(
                     latch_tag = " [NEW TRIGGER]"
 
                 print(f"  [{symbol}] Regime: {mode_icon} {mode}{latch_tag} "
-                      f"(DSS={bias['dss_signal']:+d} Lyap={bias['lyap_signal']:+d} "
-                      f"Combined={bias['combined_signal']:+d})")
+                      f"(DSS={bias['dss_signal']:+d})")
 
                 # Save regime state
                 regime_data = {
                     "mode": mode, "regime": bias["bias"],
                     "strength": bias["strength"],
                     "dss_signal": bias["dss_signal"],
-                    "lyap_signal": bias["lyap_signal"],
                     "combined_signal": bias["combined_signal"],
                     "latched": bias.get("latched", False),
                     "trigger": bias.get("trigger", "no_latch"),
