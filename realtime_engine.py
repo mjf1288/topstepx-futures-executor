@@ -559,7 +559,8 @@ async def main(dry_run: bool = False):
                         mode = state.regime.get(sym, '?')
                         pending = 'ENTRY' if sym in state.pending_entry else ''
                         active = 'POSITION' if sym in state.active_position else ''
-                        print(f"    {sym}: {mode} | price={price} cdm={cdm:.2f if cdm else '?'} {pending} {active}")
+                        cdm_str = f"{cdm:.2f}" if cdm is not None else "?"
+                        print(f"    {sym}: {mode} | price={price} cdm={cdm_str} {pending} {active}")
     
     except KeyboardInterrupt:
         print(f"\n\n  Shutting down...")
