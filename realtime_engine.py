@@ -23,11 +23,15 @@ Author: Matthew Foster
 import asyncio
 import argparse
 import json
+import logging
 import math
 import os
 import sys
 from datetime import datetime, timedelta
 from collections import defaultdict
+
+# Suppress verbose SDK logging — only show warnings/errors
+logging.getLogger('project_x_py').setLevel(logging.WARNING)
 
 import pytz
 from dotenv import load_dotenv
