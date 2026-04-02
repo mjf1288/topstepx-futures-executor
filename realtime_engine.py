@@ -446,12 +446,6 @@ async def _on_new_bar_inner(symbol: str, bar_data: dict, client, account):
     if not cdm or mode == 'NEUTRAL':
         return
     
-    # Safety: don't place orders until CDM has enough data
-    today_key = (symbol, get_futures_day(datetime.now(CT)))
-    bar_count = len(state.day_closes.get(today_key, []))
-    if bar_count < 10:
-        return  # CDM needs at least 10 bars (~50 min) to be meaningful
-    
     # Time filter: no orders before 10 PM ET on new day
     et_now = datetime.now(ET)
     if 17 <= et_now.hour < 22:
