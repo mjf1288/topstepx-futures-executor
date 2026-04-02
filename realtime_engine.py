@@ -446,10 +446,11 @@ async def _on_new_bar_inner(symbol: str, bar_data: dict, client, account):
     if not cdm or mode == 'NEUTRAL':
         return
     
-    # Time filter: no orders before 10 PM ET on new day
+    # Time filter: no orders before 10 PM ET
+    # Market opens 6 PM ET, CDM needs 4 hours to build
     et_now = datetime.now(ET)
-    if 17 <= et_now.hour < 22:
-        return  # Day roll window, CDM resetting
+    if 18 <= et_now.hour < 22:
+        return  # CDM still building, orders start at 10 PM ET
     
     # Friday after 6 PM / Saturday — markets closing
     if (et_now.weekday() == 4 and et_now.hour >= 18) or et_now.weekday() == 5:
