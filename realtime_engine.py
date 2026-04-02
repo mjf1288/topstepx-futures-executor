@@ -507,94 +507,45 @@ async def main(dry_run: bool = False):
             # Initial regime computation
             await compute_regime(client)
             
-            # Initialize TradingSuite for real-time streaming
-            suite = await TradingSuite.create(
-                instruments=SYMBOLS,
-                timeframes=["5min"],
-            )
-            
-            # Register bar callback
-            first_event_logged = [False]  # Use list for closure mutability
-            
-            async def bar_callback(event):
-                """Handle new bar events from TradingSuite."""
-                try:
-                    # Debug: log first event to understand structure
-                    if not first_event_logged[0]:
-                        first_event_logged[0] = True
-                        d = event.data
-                        inner = d.get('data', {})
-                        print(f"  [DEBUG] event.data keys: {list(d.keys())}")
-                        print(f"  [DEBUG] inner data keys: {list(inner.keys()) if isinstance(inner, dict) else dir(inner)}")
-                        print(f"  [DEBUG] inner data: {str(inner)[:500]}")
-                        print(f"  [DEBUG] source type: {type(event.source)} = {event.source}")
-                    
-                    data = event.data
-                    tf = data.get('timeframe', '')
-                    if tf != '5min':
-                        return
-                    
-                    bar = data.get('data', {})
-                    
-                    # Extract symbol — try multiple approaches
-                    symbol = None
-                    
-                    # 1. Check inner data for instrument/symbol field
-                    if isinstance(bar, dict):
-                        symbol = bar.get('symbol', bar.get('instrument', None))
-                    
-                    # 2. Check event source string
-                    if not symbol:
-                        source = str(event.source or '')
-                        for sym in SYMBOLS:
-                            if sym in source:
-                                symbol = sym
-                                break
-                    
-                    # 3. Check full data string
-                    if not symbol:
-                        data_str = str(data)
-                        for sym in SYMBOLS:
-                            if sym in data_str:
-                                symbol = sym
-                                break
-                    
-                    # 4. Identify by price range (MNQ ~24k, MES ~6.5k, MYM ~46k)
-                    if not symbol and bar:
-                        close_val = bar.get('close', bar.get('c', 0)) if isinstance(bar, dict) else getattr(bar, 'close', 0)
-                        if close_val:
-                            if 15000 < close_val < 35000:
-                                symbol = 'MNQ'
-                            elif 4000 < close_val < 10000:
-                                symbol = 'MES'
-                            elif 30000 < close_val < 60000:
-                                symbol = 'MYM'
-                    
-                    if symbol:
-                        close = None
-                        if isinstance(bar, dict):
-                            close = bar.get('close', bar.get('c'))
-                        elif hasattr(bar, 'close'):
-                            close = bar.close
-                        elif hasattr(bar, 'c'):
-                            close = bar.c
-                        
-                        if close:
+            # Create one TradingSuite per instrument — each gets its own
+            # callback with the symbol bound explicitly. No guessing.
+            suites = []
+            for sym in SYMBOLS:
+                suite = await TradingSuite.create(
+                    instruments=[sym],
+                    timeframes=["5min"],
+                )
+                
+                # Create callback with symbol bound via closure
+                def make_callback(symbol):
+                    async def bar_callback(event):
+                        try:
+                            data = event.data
+                            if data.get('timeframe') != '5min':
+                                return
+                            bar = data.get('data', {})
+                            close = bar.get('close', bar.get('c')) if isinstance(bar, dict) else getattr(bar, 'close', None)
+                            if not close:
+                                return
+                            
                             bar_data = {
                                 'close': close,
-                                'high': getattr(bar, 'high', bar.get('high', bar.get('h', close))) if isinstance(bar, dict) else getattr(bar, 'high', close),
-                                'low': getattr(bar, 'low', bar.get('low', bar.get('l', close))) if isinstance(bar, dict) else getattr(bar, 'low', close),
-                                'open': getattr(bar, 'open', bar.get('open', bar.get('o', close))) if isinstance(bar, dict) else getattr(bar, 'open', close),
+                                'high': bar.get('high', close) if isinstance(bar, dict) else getattr(bar, 'high', close),
+                                'low': bar.get('low', close) if isinstance(bar, dict) else getattr(bar, 'low', close),
+                                'open': bar.get('open', close) if isinstance(bar, dict) else getattr(bar, 'open', close),
                                 'timestamp': datetime.now(CT),
                             }
                             cdm_val = state.cdm.get(symbol)
                             cdm_str = f"{cdm_val:.2f}" if cdm_val is not None else "building..."
                             print(f"  [{symbol}] 5m bar: {close:.2f} | CDM: {cdm_str}")
                             await on_new_bar(symbol, bar_data, client, account)
-                except Exception as e:
-                    print(f"  Bar callback error: {e}")
-            
-            await suite.on(EventType.NEW_BAR, bar_callback)
+                        except Exception as e:
+                            print(f"  [{symbol}] Bar error (non-fatal): {e}")
+                    return bar_callback
+                
+                await suite.on(EventType.NEW_BAR, make_callback(sym))
+                suites.append(suite)
+                print(f"  {sym}: streaming connected")
             
             print(f"\n  STREAMING LIVE — watching {', '.join(SYMBOLS)}")
             print(f"  CDM updates on every 5-min bar close")
