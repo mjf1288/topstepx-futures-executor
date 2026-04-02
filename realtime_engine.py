@@ -514,40 +514,60 @@ async def main(dry_run: bool = False):
             )
             
             # Register bar callback
+            first_event_logged = [False]  # Use list for closure mutability
+            
             async def bar_callback(event):
-                """Handle new 5-min bar events.
-                Event structure: event.data = {
-                    'timeframe': '5min',
-                    'data': {'open': ..., 'high': ..., 'low': ..., 'close': ..., 'volume': ...},
-                    'bar_time': ...,
-                    'symbol': ...,
-                }
-                """
+                """Handle new bar events from TradingSuite."""
                 try:
-                    data = event.data
-                    tf = data.get('timeframe', '')
-                    if tf != '5min':
-                        return  # Only process 5-min bars
+                    # Debug: log first event to understand structure
+                    if not first_event_logged[0]:
+                        first_event_logged[0] = True
+                        print(f"  [DEBUG] First event type: {type(event)}")
+                        print(f"  [DEBUG] Event attrs: {[a for a in dir(event) if not a.startswith('_')]}")
+                        if hasattr(event, 'data'):
+                            print(f"  [DEBUG] event.data type: {type(event.data)}")
+                            print(f"  [DEBUG] event.data: {str(event.data)[:300]}")
+                        if hasattr(event, 'type'):
+                            print(f"  [DEBUG] event.type: {event.type}")
                     
-                    symbol = data.get('symbol', '')
-                    bar = data.get('data', {})
+                    data = event.data if hasattr(event, 'data') else event
                     
-                    if symbol in SYMBOLS and bar:
-                        close = bar.get('close', bar.get('c'))
+                    # Try multiple possible structures
+                    if isinstance(data, dict):
+                        symbol = data.get('symbol', data.get('instrument', ''))
+                        bar = data.get('data', data.get('bar', data))
+                        tf = data.get('timeframe', '')
+                    else:
+                        # Maybe event has direct attributes
+                        symbol = getattr(data, 'symbol', getattr(data, 'instrument', ''))
+                        bar = data
+                        tf = getattr(data, 'timeframe', '')
+                    
+                    if symbol in SYMBOLS:
+                        close = None
+                        if isinstance(bar, dict):
+                            close = bar.get('close', bar.get('c'))
+                        elif hasattr(bar, 'close'):
+                            close = bar.close
+                        elif hasattr(bar, 'c'):
+                            close = bar.c
+                        
                         if close:
                             bar_data = {
                                 'close': close,
-                                'high': bar.get('high', bar.get('h', close)),
-                                'low': bar.get('low', bar.get('l', close)),
-                                'open': bar.get('open', bar.get('o', close)),
+                                'high': getattr(bar, 'high', bar.get('high', bar.get('h', close))) if isinstance(bar, dict) else getattr(bar, 'high', close),
+                                'low': getattr(bar, 'low', bar.get('low', bar.get('l', close))) if isinstance(bar, dict) else getattr(bar, 'low', close),
+                                'open': getattr(bar, 'open', bar.get('open', bar.get('o', close))) if isinstance(bar, dict) else getattr(bar, 'open', close),
                                 'timestamp': datetime.now(CT),
                             }
-                            print(f"  [{symbol}] 5m bar: {close:.2f} | CDM: {state.cdm.get(symbol, '?')}")
+                            cdm_val = state.cdm.get(symbol)
+                            cdm_str = f"{cdm_val:.2f}" if cdm_val is not None else "building..."
+                            print(f"  [{symbol}] 5m bar: {close:.2f} | CDM: {cdm_str}")
                             await on_new_bar(symbol, bar_data, client, account)
                 except Exception as e:
                     print(f"  Bar callback error: {e}")
             
-            await suite.events.on(EventType.NEW_BAR, bar_callback)
+            await suite.on(EventType.NEW_BAR, bar_callback)
             
             print(f"\n  STREAMING LIVE — watching {', '.join(SYMBOLS)}")
             print(f"  CDM updates on every 5-min bar close")
