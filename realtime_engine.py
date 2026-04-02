@@ -522,15 +522,12 @@ async def main(dry_run: bool = False):
                     # Debug: log first event to understand structure
                     if not first_event_logged[0]:
                         first_event_logged[0] = True
-                        print(f"  [DEBUG] First event type: {type(event)}")
-                        print(f"  [DEBUG] Event attrs: {[a for a in dir(event) if not a.startswith('_')]}")
-                        if hasattr(event, 'data'):
-                            print(f"  [DEBUG] event.data type: {type(event.data)}")
-                            print(f"  [DEBUG] event.data: {str(event.data)[:300]}")
-                        if hasattr(event, 'type'):
-                            print(f"  [DEBUG] event.type: {event.type}")
-                        if hasattr(event, 'source'):
-                            print(f"  [DEBUG] event.source: {event.source}")
+                        d = event.data
+                        inner = d.get('data', {})
+                        print(f"  [DEBUG] event.data keys: {list(d.keys())}")
+                        print(f"  [DEBUG] inner data keys: {list(inner.keys()) if isinstance(inner, dict) else dir(inner)}")
+                        print(f"  [DEBUG] inner data: {str(inner)[:500]}")
+                        print(f"  [DEBUG] source type: {type(event.source)} = {event.source}")
                     
                     data = event.data
                     tf = data.get('timeframe', '')
@@ -539,20 +536,39 @@ async def main(dry_run: bool = False):
                     
                     bar = data.get('data', {})
                     
-                    # Symbol comes from event source (suite context)
-                    source = event.source or ''
+                    # Extract symbol — try multiple approaches
                     symbol = None
-                    for sym in SYMBOLS:
-                        if sym in str(source):
-                            symbol = sym
-                            break
                     
-                    # Fallback: try to extract from contract info in bar
+                    # 1. Check inner data for instrument/symbol field
+                    if isinstance(bar, dict):
+                        symbol = bar.get('symbol', bar.get('instrument', None))
+                    
+                    # 2. Check event source string
                     if not symbol:
+                        source = str(event.source or '')
                         for sym in SYMBOLS:
-                            if sym in str(data):
+                            if sym in source:
                                 symbol = sym
                                 break
+                    
+                    # 3. Check full data string
+                    if not symbol:
+                        data_str = str(data)
+                        for sym in SYMBOLS:
+                            if sym in data_str:
+                                symbol = sym
+                                break
+                    
+                    # 4. Identify by price range (MNQ ~24k, MES ~6.5k, MYM ~46k)
+                    if not symbol and bar:
+                        close_val = bar.get('close', bar.get('c', 0)) if isinstance(bar, dict) else getattr(bar, 'close', 0)
+                        if close_val:
+                            if 15000 < close_val < 35000:
+                                symbol = 'MNQ'
+                            elif 4000 < close_val < 10000:
+                                symbol = 'MES'
+                            elif 30000 < close_val < 60000:
+                                symbol = 'MYM'
                     
                     if symbol:
                         close = None
