@@ -529,21 +529,32 @@ async def main(dry_run: bool = False):
                             print(f"  [DEBUG] event.data: {str(event.data)[:300]}")
                         if hasattr(event, 'type'):
                             print(f"  [DEBUG] event.type: {event.type}")
+                        if hasattr(event, 'source'):
+                            print(f"  [DEBUG] event.source: {event.source}")
                     
-                    data = event.data if hasattr(event, 'data') else event
+                    data = event.data
+                    tf = data.get('timeframe', '')
+                    if tf != '5min':
+                        return
                     
-                    # Try multiple possible structures
-                    if isinstance(data, dict):
-                        symbol = data.get('symbol', data.get('instrument', ''))
-                        bar = data.get('data', data.get('bar', data))
-                        tf = data.get('timeframe', '')
-                    else:
-                        # Maybe event has direct attributes
-                        symbol = getattr(data, 'symbol', getattr(data, 'instrument', ''))
-                        bar = data
-                        tf = getattr(data, 'timeframe', '')
+                    bar = data.get('data', {})
                     
-                    if symbol in SYMBOLS:
+                    # Symbol comes from event source (suite context)
+                    source = event.source or ''
+                    symbol = None
+                    for sym in SYMBOLS:
+                        if sym in str(source):
+                            symbol = sym
+                            break
+                    
+                    # Fallback: try to extract from contract info in bar
+                    if not symbol:
+                        for sym in SYMBOLS:
+                            if sym in str(data):
+                                symbol = sym
+                                break
+                    
+                    if symbol:
                         close = None
                         if isinstance(bar, dict):
                             close = bar.get('close', bar.get('c'))
