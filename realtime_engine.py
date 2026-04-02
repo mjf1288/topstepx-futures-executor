@@ -58,8 +58,8 @@ REGIME_FILE = os.path.join(SCRIPT_DIR, "regime_state.json")
 ORDERS_FILE = os.path.join(SCRIPT_DIR, "orders_state.json")
 TRADE_LOG_FILE = os.path.join(SCRIPT_DIR, "trade_log.json")
 
-# How often to recompute regime (8h bars) — in seconds
-REGIME_RECOMPUTE_INTERVAL = 8 * 60 * 60  # 8 hours
+# Regime recompute times (ET hours): 6 PM, 1 AM, 9 AM
+REGIME_RECOMPUTE_HOURS_ET = [18, 1, 9]
 
 # How often to refresh ATR from daily bars — in seconds
 ATR_REFRESH_INTERVAL = 4 * 60 * 60  # 4 hours
@@ -680,9 +680,12 @@ async def main(dry_run: bool = False):
             while True:
                 await asyncio.sleep(60)
                 
-                # Recompute regime every 8 hours
-                if (state.last_regime_compute is None or 
-                    (datetime.now() - state.last_regime_compute).seconds > REGIME_RECOMPUTE_INTERVAL):
+                # Recompute regime at specific session times: 6 PM, 1 AM, 9 AM ET
+                et_check = datetime.now(ET)
+                if (et_check.hour in REGIME_RECOMPUTE_HOURS_ET and 
+                    et_check.minute < 2 and  # Within first 2 min of the hour
+                    (state.last_regime_compute is None or
+                     (datetime.now() - state.last_regime_compute).seconds > 3600)):  # At least 1hr since last
                     await compute_regime(client)
                 
                 # Periodic status
