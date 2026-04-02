@@ -113,11 +113,25 @@ state = EngineState()
 # ─────────────────────────────────────────────────────────────
 # MEAN LEVEL COMPUTATION (running)
 # ─────────────────────────────────────────────────────────────
+def get_futures_day(ct_time):
+    """Get the futures trading day date. Day rolls at 5 PM CT.
+    Bars after 5 PM CT belong to the NEXT trading day."""
+    if ct_time.hour >= 17:
+        return (ct_time + timedelta(days=1)).date()
+    return ct_time.date()
+
+
+def get_futures_month(ct_time):
+    """Get the futures trading month. Uses same 5 PM CT roll."""
+    d = get_futures_day(ct_time)
+    return (d.year, d.month)
+
+
 def update_running_means(symbol: str, close: float, timestamp: datetime):
     """Update CDM and CMM with a new bar close. Called on every 5-min bar."""
     ct_time = timestamp.astimezone(CT)
-    today = ct_time.date()
-    this_month = (ct_time.year, ct_time.month)
+    today = get_futures_day(ct_time)
+    this_month = get_futures_month(ct_time)
     
     # Day roll detection
     day_key = (symbol, today)
@@ -432,6 +446,12 @@ async def _on_new_bar_inner(symbol: str, bar_data: dict, client, account):
     if not cdm or mode == 'NEUTRAL':
         return
     
+    # Safety: don't place orders until CDM has enough data
+    today_key = (symbol, get_futures_day(datetime.now(CT)))
+    bar_count = len(state.day_closes.get(today_key, []))
+    if bar_count < 10:
+        return  # CDM needs at least 10 bars (~50 min) to be meaningful
+    
     # Time filter: no orders before 10 PM ET on new day
     et_now = datetime.now(ET)
     if 17 <= et_now.hour < 22:
@@ -503,6 +523,116 @@ async def main(dry_run: bool = False):
             
             print(f"  Account: {account.name}")
             print(f"  Balance: ${account.balance:,.2f}")
+            
+            # ── STARTUP: Seed historical data ──
+            print(f"\n  Loading historical bars to seed CDM/PDM/CMM/PMM...")
+            import aiohttp
+            token = client.get_session_token()
+            base_url = client.base_url
+            api_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+            
+            CONTRACT_MAP = {
+                'MNQ': ('CON.F.US.MNQ.M26', 'CON.F.US.MNQ.H26', 0.25),
+                'MES': ('CON.F.US.MES.M26', 'CON.F.US.MES.H26', 0.25),
+                'MYM': ('CON.F.US.MYM.M26', 'CON.F.US.MYM.H26', 1.0),
+            }
+            
+            import requests as sync_requests
+            now_utc = datetime.now(timezone.utc)
+            
+            for sym in SYMBOLS:
+                curr_contract, prior_contract, tick = CONTRACT_MAP[sym]
+                
+                # Fetch 5-min bars (last 3 days for CDM/PDM)
+                payload_5m = {
+                    "contractId": curr_contract, "live": False,
+                    "startTime": (now_utc - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "unit": 1, "unitNumber": 5, "limit": 5000, "includePartialBar": True,
+                }
+                resp = sync_requests.post(f'{base_url}/History/retrieveBars', json=payload_5m, headers=api_headers)
+                bars_5m = resp.json().get('bars', [])
+                
+                # Fetch hourly bars (stitched, for CMM/PMM)
+                def fetch_stitch(c1, c2, unit, un, lim=5000):
+                    r1 = sync_requests.post(f'{base_url}/History/retrieveBars', json={
+                        "contractId": c1, "live": False,
+                        "startTime": (now_utc - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "unit": unit, "unitNumber": un, "limit": lim, "includePartialBar": True,
+                    }, headers=api_headers).json().get('bars', [])
+                    r2 = sync_requests.post(f'{base_url}/History/retrieveBars', json={
+                        "contractId": c2, "live": False,
+                        "startTime": (now_utc - timedelta(days=200)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "unit": unit, "unitNumber": un, "limit": lim, "includePartialBar": True,
+                    }, headers=api_headers).json().get('bars', [])
+                    if not r1 or not r2: return r1 or r2
+                    r2.sort(key=lambda x: x['t']); r1.sort(key=lambda x: x['t'])
+                    gap = r1[0]['o'] - r2[-1]['c']
+                    for b in r2: b['o']+=gap;b['h']+=gap;b['l']+=gap;b['c']+=gap
+                    ft = r1[0]['t']
+                    return [b for b in r2 if b['t'] < ft] + r1
+                
+                hourly = fetch_stitch(curr_contract, prior_contract, 3, 1)
+                hourly.sort(key=lambda x: x['t'])
+                
+                # Seed CDM/PDM from 5-min bars using futures day boundary
+                from collections import defaultdict
+                day_closes = defaultdict(list)
+                for b in bars_5m:
+                    ts = datetime.fromisoformat(b['t']).astimezone(CT)
+                    fday = get_futures_day(ts)
+                    day_closes[(sym, fday)].append(b['c'])
+                
+                now_ct = datetime.now(CT)
+                today = get_futures_day(now_ct)
+                sorted_days = sorted(set(d for s, d in day_closes if s == sym))
+                
+                # CDM
+                today_key = (sym, today)
+                if today_key in day_closes:
+                    state.day_closes[today_key] = day_closes[today_key]
+                    state.cdm[sym] = sum(day_closes[today_key]) / len(day_closes[today_key])
+                    print(f"  {sym} CDM: {state.cdm[sym]:.2f} ({len(day_closes[today_key])} bars)")
+                
+                # PDM
+                if len(sorted_days) >= 2:
+                    yesterday = sorted_days[-2] if sorted_days[-1] == today else sorted_days[-1]
+                    yd_key = (sym, yesterday)
+                    if yd_key in day_closes:
+                        state.prev_day_mean[sym] = sum(day_closes[yd_key]) / len(day_closes[yd_key])
+                        print(f"  {sym} PDM: {state.prev_day_mean[sym]:.2f}")
+                
+                # CMM/PMM from hourly
+                month_closes = defaultdict(list)
+                for b in hourly:
+                    ts = datetime.fromisoformat(b['t']).astimezone(CT)
+                    fmonth = get_futures_month(ts)
+                    month_closes[fmonth].append(b['c'])
+                
+                this_month = get_futures_month(now_ct)
+                if this_month in month_closes:
+                    state.cmm[sym] = sum(month_closes[this_month]) / len(month_closes[this_month])
+                    state.month_closes[(sym, *this_month)] = month_closes[this_month]
+                    print(f"  {sym} CMM: {state.cmm[sym]:.2f} ({len(month_closes[this_month])} bars)")
+                
+                prev_m = (this_month[0], this_month[1]-1) if this_month[1]>1 else (this_month[0]-1, 12)
+                if prev_m in month_closes:
+                    state.prev_month_mean[sym] = sum(month_closes[prev_m]) / len(month_closes[prev_m])
+                    print(f"  {sym} PMM: {state.prev_month_mean[sym]:.2f}")
+                
+                # ATR from stitched daily bars
+                daily = fetch_stitch(curr_contract, prior_contract, 4, 1, 500)
+                daily.sort(key=lambda x: x['t'])
+                if len(daily) >= 15:
+                    trs = [daily[i]['h'] - daily[i]['l'] for i in range(-14, 0)]
+                    state.atr[sym] = sum(trs) / len(trs)
+                    print(f"  {sym} ATR(14): {state.atr[sym]:.2f}")
+            
+            state.current_day = today
+            state.current_month = this_month
+            print(f"  Historical data loaded. Futures day: {today}")
             
             # Initial regime computation
             await compute_regime(client)

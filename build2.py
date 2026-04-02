@@ -108,22 +108,32 @@ def main():
         all_1h.sort(key=lambda x: x['t'])
         print(f"  1h bars for CMM: {len(all_1h)}")
 
-        # Group hourly by month and day
+        # Group hourly by futures trading day and month
+        # Futures day rolls at 5 PM CT — bars after 5 PM belong to next day
         month_data = {}
         day_data = {}
         for b in all_1h:
             ts = datetime.fromisoformat(b['t']).astimezone(ct)
-            ym = (ts.year, ts.month)
-            month_data.setdefault(ym, []).append((ts, b['c']))
-            day_data.setdefault(ts.date(), []).append((ts, b['c']))
+            # Futures day: after 5 PM CT = next calendar date
+            if ts.hour >= 17:
+                fday = (ts + timedelta(days=1)).date()
+            else:
+                fday = ts.date()
+            fmonth = (fday.year, fday.month)
+            month_data.setdefault(fmonth, []).append((ts, b['c']))
+            day_data.setdefault(fday, []).append((ts, b['c']))
         sorted_dates = sorted(day_data.keys())
 
         # 5. Compute all mean levels + execution markers at each 8h bar
         chart_data = []
         for i, b in enumerate(bars_8h):
             bar_ts = datetime.fromisoformat(b['t']).astimezone(ct)
-            bar_ym = (bar_ts.year, bar_ts.month)
-            bar_date = bar_ts.date()
+            # Use futures day boundary (5 PM CT roll)
+            if bar_ts.hour >= 17:
+                bar_date = (bar_ts + timedelta(days=1)).date()
+            else:
+                bar_date = bar_ts.date()
+            bar_ym = (bar_date.year, bar_date.month)
             price = b['c']
 
             # CMM: running mean of current month

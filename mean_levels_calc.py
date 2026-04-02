@@ -101,11 +101,17 @@ def compute_mean_levels(
     # Sort by timestamp
     df = bars.sort("timestamp")
 
-    # Add grouping columns
+    # Futures trading day rolls at 5 PM CT (17:00).
+    # Shift timestamps by +7 hours so that bars after 5 PM CT
+    # get grouped into the NEXT calendar date.
+    # Example: 5:01 PM CT on Apr 1 → shifted to 12:01 AM Apr 2 → date = Apr 2
+    #          4:59 PM CT on Apr 1 → shifted to 11:59 PM Apr 1 → date = Apr 1
     df = df.with_columns([
-        pl.col("timestamp").dt.date().alias("date"),
-        (pl.col("timestamp").dt.year().cast(pl.Utf8) + "-" +
-         pl.col("timestamp").dt.month().cast(pl.Utf8).str.pad_start(2, "0")).alias("year_month"),
+        (pl.col("timestamp") + pl.duration(hours=7)).dt.date().alias("date"),
+        (pl.col("timestamp") + pl.duration(hours=7)).dt.year().cast(pl.Utf8).str.cat(
+            (pl.col("timestamp") + pl.duration(hours=7)).dt.month().cast(pl.Utf8).str.pad_start(2, "0"),
+            separator="-"
+        ).alias("year_month"),
     ])
 
     current_price = float(df["close"][-1])
