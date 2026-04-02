@@ -157,7 +157,7 @@ def update_running_means(symbol: str, close: float, timestamp: datetime):
 def get_gate_level(symbol: str) -> tuple:
     """Get the structure gate level — PMM for days 1-3, CMM after."""
     ct_now = datetime.now(CT)
-    if ct_now.day <= 3 and symbol in state.prev_month_mean:
+    if ct_now.day <= 3 and state.prev_month_mean.get(symbol) is not None:
         return state.prev_month_mean[symbol], "PMM"
     return state.cmm.get(symbol), "CMM"
 
@@ -407,7 +407,16 @@ async def compute_regime(client):
 # MAIN LOOP
 # ─────────────────────────────────────────────────────────────
 async def on_new_bar(symbol: str, bar_data: dict, client, account):
-    """Called on every new 5-min bar close. Core execution logic."""
+    """Called on every new 5-min bar close. Core execution logic.
+    Wrapped in try/except so a single bar error never kills the engine."""
+    try:
+        await _on_new_bar_inner(symbol, bar_data, client, account)
+    except Exception as e:
+        print(f"  [{symbol}] Bar processing error (non-fatal): {e}")
+
+
+async def _on_new_bar_inner(symbol: str, bar_data: dict, client, account):
+    """Inner logic for on_new_bar."""
     close = bar_data['close']
     timestamp = bar_data.get('timestamp', datetime.now(CT))
     tick_size = 0.25 if symbol in ('MES', 'MNQ') else 1.0
@@ -554,17 +563,21 @@ async def main(dry_run: bool = False):
                     await compute_regime(client)
                 
                 # Periodic status
-                et_now = datetime.now(ET)
-                if et_now.minute == 0:  # Print status every hour
-                    print(f"\n  [{et_now.strftime('%H:%M')}] Status:")
-                    for sym in SYMBOLS:
-                        cdm = state.cdm.get(sym)
-                        price = state.current_price.get(sym)
-                        mode = state.regime.get(sym, '?')
-                        pending = 'ENTRY' if sym in state.pending_entry else ''
-                        active = 'POSITION' if sym in state.active_position else ''
-                        cdm_str = f"{cdm:.2f}" if cdm is not None else "?"
-                        print(f"    {sym}: {mode} | price={price} cdm={cdm_str} {pending} {active}")
+                try:
+                    et_now = datetime.now(ET)
+                    if et_now.minute == 0:  # Print status every hour
+                        print(f"\n  [{et_now.strftime('%H:%M')}] Status:")
+                        for sym in SYMBOLS:
+                            cdm = state.cdm.get(sym)
+                            price = state.current_price.get(sym)
+                            mode = state.regime.get(sym, '?')
+                            pending = 'ENTRY' if sym in state.pending_entry else ''
+                            active = 'POSITION' if sym in state.active_position else ''
+                            cdm_str = f"{cdm:.2f}" if cdm is not None else "?"
+                            price_str = f"{price:.2f}" if price is not None else "?"
+                            print(f"    {sym}: {mode} | price={price_str} cdm={cdm_str} {pending} {active}")
+                except Exception as e:
+                    print(f"  Status print error (non-fatal): {e}")
     
     except KeyboardInterrupt:
         print(f"\n\n  Shutting down...")
