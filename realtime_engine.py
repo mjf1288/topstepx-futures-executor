@@ -290,7 +290,10 @@ async def check_and_bracket(client, account, symbol: str):
             entry_price = pending['entry_price']
             side = pending['side']
             stop_side = 1 if side == 0 else 0
-            atr = state.atr.get(symbol, 100)
+            atr = state.atr.get(symbol)
+            if not atr:
+                print(f"  [{symbol}] WARNING: No ATR data — cannot place bracket safely")
+                return
             stop_dist = atr * DEFAULT_ATR_MULTIPLIER
             tick_size = 0.25 if symbol in ('MES', 'MNQ') else 1.0
             
@@ -468,11 +471,51 @@ async def _on_new_bar_inner(symbol: str, bar_data: dict, client, account):
         elif mode == 'SELL' and close > gate_level:
             return  # Above gate, skip
     
-    # Skip if already have active position in this symbol
+    # DUPLICATE PREVENTION: skip if we already have ANY order or position
     if symbol in state.active_position:
-        # Check if position is still open
+        return  # Already have a bracketed position
+    if symbol in state.pending_entry:
+        # Already have a pending entry — just check if it filled
         await check_and_bracket(client, account, symbol)
         return
+    
+    # Also check via API that we don't have an open position
+    # (catches cases where state got out of sync)
+    import aiohttp
+    try:
+        token = client.get_session_token()
+        base_url = client.base_url
+        api_headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f'{base_url}/Position/searchOpen',
+                                 json={'accountId': account.id},
+                                 headers=api_headers) as resp:
+                data = await resp.json()
+                for p in data.get('positions', []):
+                    cid = p.get('contractId', '')
+                    parts = cid.split('.')
+                    sym = parts[3] if len(parts) >= 4 else ''
+                    if sym == symbol:
+                        print(f"  [{symbol}] Position already open (API check) — skipping")
+                        state.active_position[symbol] = {'entry': p['averagePrice'], 'side': 1}
+                        return
+    except Exception as e:
+        print(f"  [{symbol}] Position check error: {e}")
+    
+    # Also check open orders via API
+    try:
+        async with aiohttp.ClientSession() as http:
+            async with http.post(f'{base_url}/Order/searchOpen',
+                                 json={'accountId': account.id},
+                                 headers=api_headers) as resp:
+                data = await resp.json()
+                for o in data.get('orders', []):
+                    sym_id = o.get('symbolId', '')
+                    if symbol in sym_id and o.get('type') == 1:  # Limit entry
+                        print(f"  [{symbol}] Entry order already open (API check) — skipping")
+                        return
+    except Exception as e:
+        print(f"  [{symbol}] Order check error: {e}")
     
     # Get closest entry level
     entry_price, level_name, dist = get_closest_entry_level(symbol, mode, close, tick_size)
@@ -488,11 +531,8 @@ async def _on_new_bar_inner(symbol: str, bar_data: dict, client, account):
     
     side = 0 if mode == 'BUY' else 1
     
-    # Place or update the entry limit to track CDM
+    # Place entry limit at live CDM
     await place_or_update_entry(client, account, symbol, contract_id, side, entry_price, tick_size)
-    
-    # Check for fills
-    await check_and_bracket(client, account, symbol)
 
 
 async def main(dry_run: bool = False):
