@@ -38,13 +38,16 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
-SYMBOLS = ["MNQ", "MES", "MYM"]
+SYMBOLS = ["MNQ", "MES", "MYM", "MGC"]
 
 CONTRACT_MAP = {
     'MNQ': ('CON.F.US.MNQ.M26', 'CON.F.US.MNQ.H26', 0.25, 0.50),
     'MES': ('CON.F.US.MES.M26', 'CON.F.US.MES.H26', 0.25, 1.25),
     'MYM': ('CON.F.US.MYM.M26', 'CON.F.US.MYM.H26', 1.0, 0.50),
+    'MGC': ('CON.F.US.MGC.M26', 'CON.F.US.MGC.J26', 0.10, 1.00),
 }
+
+MAX_CONTRACTS_PER_INSTRUMENT = 4  # One per level (CDM, PDM, CMM, PMM)
 
 ATR_MULTIPLIER = 1.0
 RR_RATIO = 2.0
@@ -68,8 +71,8 @@ class State:
         self.atr = {}             # {symbol: ATR}
         self.day_closes = defaultdict(list)    # {(symbol, date): [closes]}
         self.month_closes = defaultdict(list)  # {(symbol, year, month): [closes]}
-        self.pending_entry = {}   # {symbol: {order_id, entry_price, ...}}
-        self.active_position = {} # {symbol: {entry, stop, target, ...}}
+        self.pending_entries = {}  # {(symbol, level_name): {order_id, entry_price, ...}}
+        self.active_positions = {} # {(symbol, level_name): {entry, stop, target, ...}}
         self.session_losses = defaultdict(int)  # {symbol: consecutive loss count}
         self.session_day = None   # Track which session day we're in
         self.current_day = None
@@ -132,143 +135,111 @@ def update_running_means(symbol, close, timestamp):
     state.cmm[symbol] = sum(state.month_closes[month_key]) / len(state.month_closes[month_key])
 
 
-def get_closest_entry(symbol, mode, price, tick_size):
-    """Get closest mean level for entry in the given mode."""
+def get_all_eligible_levels(symbol, mode, price, tick_size):
+    """Get ALL mean levels eligible for entry in the given mode."""
     levels = {
         'CDM': state.cdm.get(symbol),
         'PDM': state.pdm.get(symbol),
         'CMM': state.cmm.get(symbol),
         'PMM': state.pmm.get(symbol),
     }
-    candidates = []
+    result = []
     for name, level in levels.items():
         if level is None:
             continue
-        if mode == 'BUY' and level < price:
-            candidates.append((abs(price - level), name, level))
-        elif mode == 'SELL' and level > price:
-            candidates.append((abs(level - price), name, level))
-
-    if not candidates:
-        return None, None
-    candidates.sort()
-    _, name, level = candidates[0]
-    entry = round(round(level / tick_size) * tick_size, 6)
-    return entry, name
+        entry = round(round(level / tick_size) * tick_size, 6)
+        if mode == 'BUY' and entry < price:
+            result.append((name, entry))
+        elif mode == 'SELL' and entry > price:
+            result.append((name, entry))
+    return result
 
 
 # ─────────────────────────────────────────────────────────────
 # ORDER MANAGEMENT
 # ─────────────────────────────────────────────────────────────
-async def place_or_update_entry(client, account, symbol, contract_id, side, entry_price, tick_size):
-    """Place new entry or move existing to track CDM."""
+async def place_or_update_entry(client, account, symbol, level_name, contract_id, side, entry_price, tick_size):
+    """Place or update entry limit for a specific symbol+level."""
     import aiohttp
     token = client.get_session_token()
     base_url = client.base_url
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    key = (symbol, level_name)
 
-    existing = state.pending_entry.get(symbol)
+    existing = state.pending_entries.get(key)
     if existing:
         if abs(entry_price - existing['entry_price']) < tick_size * 2:
-            return  # CDM hasn't moved enough
+            return  # Level hasn't moved enough
         # Cancel old
         if not state.dry_run:
             async with aiohttp.ClientSession() as http:
                 await http.post(f'{base_url}/Order/cancel',
                     json={'orderId': existing['order_id'], 'accountId': account.id},
-                    headers=headers)
-        print(f"  [{symbol}] Entry moved: {existing['entry_price']} -> {entry_price}")
+                    headers=hdrs)
+        print(f"  [{symbol}] {level_name} moved: {existing['entry_price']} -> {entry_price}")
 
     side_str = 'BUY' if side == 0 else 'SELL'
+    atr = state.atr.get(symbol)
+    if not atr:
+        return
+    stop_dist = atr * ATR_MULTIPLIER
+
+    if side == 0:  # BUY
+        stop = round(round((entry_price - stop_dist) / tick_size) * tick_size, 6)
+        target = round(round((entry_price + stop_dist * RR_RATIO) / tick_size) * tick_size, 6)
+    else:  # SELL
+        stop = round(round((entry_price + stop_dist) / tick_size) * tick_size, 6)
+        target = round(round((entry_price - stop_dist * RR_RATIO) / tick_size) * tick_size, 6)
+
     if state.dry_run:
-        print(f"  [{symbol}] DRY RUN: {side_str} LIMIT @ {entry_price}")
-        state.pending_entry[symbol] = {'order_id': 'DRY', 'entry_price': entry_price,
-                                        'side': side, 'contract_id': contract_id}
+        print(f"  [{symbol}] DRY: {side_str} {level_name} @ {entry_price} | stop {stop} | target {target}")
+        state.pending_entries[key] = {'order_id': 'DRY', 'entry_price': entry_price,
+            'side': side, 'contract_id': contract_id, 'stop': stop, 'target': target,
+            'level': level_name}
         return
 
+    stop_side = 1 if side == 0 else 0
     async with aiohttp.ClientSession() as http:
-        async with http.post(f'{base_url}/Order/place', json={
+        # Place entry
+        r = await (await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
             'type': 1, 'side': side, 'size': 1, 'limitPrice': entry_price,
-        }, headers=headers) as resp:
-            res = await resp.json()
-            if res.get('success'):
-                state.pending_entry[symbol] = {
-                    'order_id': res['orderId'], 'entry_price': entry_price,
-                    'side': side, 'contract_id': contract_id,
-                }
-                print(f"  [{symbol}] {side_str} LIMIT @ {entry_price}")
-            else:
-                print(f"  [{symbol}] Order failed: {res}")
-
-
-async def check_fill_and_bracket(client, account, symbol):
-    """Check if pending entry filled, place bracket if so."""
-    import aiohttp
-    pending = state.pending_entry.get(symbol)
-    if not pending or pending.get('order_id') == 'DRY':
-        return
-
-    token = client.get_session_token()
-    base_url = client.base_url
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-
-    async with aiohttp.ClientSession() as http:
-        async with http.post(f'{base_url}/Position/searchOpen',
-                             json={'accountId': account.id}, headers=headers) as resp:
-            data = await resp.json()
-
-    for p in data.get('positions', []):
-        cid = p.get('contractId', '')
-        parts = cid.split('.')
-        sym = parts[3] if len(parts) >= 4 else ''
-        if sym == symbol and symbol not in state.active_position:
-            entry_price = pending['entry_price']
-            side = pending['side']
-            stop_side = 1 if side == 0 else 0
-            atr = state.atr.get(symbol)
-            if not atr:
-                print(f"  [{symbol}] WARNING: No ATR — cannot bracket")
-                return
-
-            tick_size = CONTRACT_MAP[symbol][2]
-            stop_dist = atr * ATR_MULTIPLIER
-
-            if side == 0:  # BUY
-                stop = round(round((entry_price - stop_dist) / tick_size) * tick_size, 6)
-                target = round(round((entry_price + stop_dist * RR_RATIO) / tick_size) * tick_size, 6)
-            else:  # SELL
-                stop = round(round((entry_price + stop_dist) / tick_size) * tick_size, 6)
-                target = round(round((entry_price - stop_dist * RR_RATIO) / tick_size) * tick_size, 6)
-
-            print(f"\n  *** [{symbol}] FILLED @ {entry_price} ***")
-            print(f"  Stop: {stop} | Target: {target}")
-
-            if not state.dry_run:
-                async with aiohttp.ClientSession() as http:
-                    r1 = await (await http.post(f'{base_url}/Order/place', json={
-                        'accountId': account.id, 'contractId': pending['contract_id'],
-                        'type': 4, 'side': stop_side, 'size': 1, 'stopPrice': stop,
-                    }, headers=headers)).json()
-                    r2 = await (await http.post(f'{base_url}/Order/place', json={
-                        'accountId': account.id, 'contractId': pending['contract_id'],
-                        'type': 1, 'side': stop_side, 'size': 1, 'limitPrice': target,
-                    }, headers=headers)).json()
-                    print(f"  STOP: {r1.get('orderId')} | TARGET: {r2.get('orderId')}")
-
-            state.active_position[symbol] = {
-                'entry': entry_price, 'stop': stop, 'target': target,
-                'side': side, 'contract_id': pending['contract_id'],
-            }
-            del state.pending_entry[symbol]
+        }, headers=hdrs)).json()
+        if not r.get('success'):
+            print(f"  [{symbol}] {level_name} entry failed: {r}")
             return
+        entry_id = r['orderId']
+
+        # Place stop
+        r_stop = await (await http.post(f'{base_url}/Order/place', json={
+            'accountId': account.id, 'contractId': contract_id,
+            'type': 4, 'side': stop_side, 'size': 1, 'stopPrice': stop,
+        }, headers=hdrs)).json()
+        stop_id = r_stop.get('orderId')
+
+        # Place target
+        r_tp = await (await http.post(f'{base_url}/Order/place', json={
+            'accountId': account.id, 'contractId': contract_id,
+            'type': 1, 'side': stop_side, 'size': 1, 'limitPrice': target,
+        }, headers=hdrs)).json()
+        target_id = r_tp.get('orderId')
+
+    state.pending_entries[key] = {
+        'order_id': entry_id, 'stop_id': stop_id, 'target_id': target_id,
+        'entry_price': entry_price, 'stop': stop, 'target': target,
+        'side': side, 'contract_id': contract_id, 'level': level_name,
+    }
+    print(f"  [{symbol}] {side_str} {level_name} @ {entry_price} | stop {stop} | target {target}")
+
+
+# Brackets are now placed WITH the entry — no separate fill check needed
 
 
 # ─────────────────────────────────────────────────────────────
 # BAR HANDLER
 # ─────────────────────────────────────────────────────────────
 async def on_new_bar(symbol, bar_data, client, account):
-    """Process a new 5-min bar. Core logic."""
+    """Process a new 5-min bar. Place/update orders at ALL eligible levels."""
     try:
         close = bar_data['close']
         tick_size = CONTRACT_MAP[symbol][2]
@@ -287,10 +258,8 @@ async def on_new_bar(symbol, bar_data, client, account):
         et_now = datetime.now(ET)
         if 18 <= et_now.hour < 22:
             return
-        # Friday close / Saturday
         if (et_now.weekday() == 4 and et_now.hour >= 18) or et_now.weekday() == 5:
             return
-        # Sunday before 10 PM
         if et_now.weekday() == 6 and et_now.hour < 22:
             return
 
@@ -302,43 +271,8 @@ async def on_new_bar(symbol, bar_data, client, account):
             state.session_losses.clear()
             state.session_day = today
 
-        # 3 consecutive losses = stop trading this symbol for the session
+        # 3 consecutive losses = stop this symbol for the session
         if state.session_losses[symbol] >= 3:
-            return
-
-        # DUPLICATE PREVENTION
-        if symbol in state.active_position:
-            return
-        if symbol in state.pending_entry:
-            await check_fill_and_bracket(client, account, symbol)
-            return
-
-        # API position check (catches state desync)
-        import aiohttp
-        try:
-            token = client.get_session_token()
-            base_url = client.base_url
-            api_h = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-            async with aiohttp.ClientSession() as http:
-                async with http.post(f'{base_url}/Position/searchOpen',
-                                     json={'accountId': account.id}, headers=api_h) as resp:
-                    for p in (await resp.json()).get('positions', []):
-                        cid = p.get('contractId', '')
-                        parts = cid.split('.')
-                        if len(parts) >= 4 and parts[3] == symbol:
-                            state.active_position[symbol] = {'entry': p['averagePrice']}
-                            return
-                async with http.post(f'{base_url}/Order/searchOpen',
-                                     json={'accountId': account.id}, headers=api_h) as resp:
-                    for o in (await resp.json()).get('orders', []):
-                        if symbol in o.get('symbolId', '') and o.get('type') == 1:
-                            return
-        except:
-            pass
-
-        # Get entry level
-        entry_price, level_name = get_closest_entry(symbol, mode, close, tick_size)
-        if not entry_price:
             return
 
         # Get contract ID
@@ -349,7 +283,16 @@ async def on_new_bar(symbol, bar_data, client, account):
             return
 
         side = 0 if mode == 'BUY' else 1
-        await place_or_update_entry(client, account, symbol, contract_id, side, entry_price, tick_size)
+
+        # Place/update at ALL eligible levels (1 order per level)
+        eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
+        for level_name, entry_price in eligible:
+            key = (symbol, level_name)
+            if key in state.active_positions:
+                continue  # Already filled at this level
+            # Place new or update existing
+            await place_or_update_entry(client, account, symbol, level_name,
+                                        contract_id, side, entry_price, tick_size)
 
     except Exception as e:
         print(f"  [{symbol}] Error (non-fatal): {e}")
@@ -527,51 +470,60 @@ async def main(mode: str, dry_run: bool = False):
                         async with http.post(f'{base_url}/Position/searchOpen',
                                              json={'accountId': account.id}, headers=api_h) as resp:
                             open_positions = await resp.json()
-                            open_syms = set()
+                            # Count open contracts per symbol
+                            open_count = defaultdict(int)
                             for p in open_positions.get('positions', []):
                                 cid = p.get('contractId', '')
                                 parts = cid.split('.')
                                 if len(parts) >= 4:
-                                    open_syms.add(parts[3])
+                                    open_count[parts[3]] += p.get('size', 1)
 
-                    for sym in list(state.active_position.keys()):
-                        if sym not in open_syms:
-                            pos = state.active_position[sym]
-                            # Position closed — determine if win or loss
-                            current = state.current_price.get(sym, 0)
-                            entry = pos.get('entry', 0)
+                    # Check each active position key
+                    for key in list(state.active_positions.keys()):
+                        sym, level = key
+                        # If symbol has fewer open positions than tracked, something closed
+                        tracked = sum(1 for k in state.active_positions if k[0] == sym)
+                        if open_count.get(sym, 0) < tracked:
+                            pos = state.active_positions[key]
                             side = pos.get('side', 1)
-                            if side == 0:  # BUY
-                                pnl = current - entry
-                            else:  # SELL
-                                pnl = entry - current
-                            
+                            entry = pos.get('entry', 0)
+                            current = state.current_price.get(sym, 0)
+                            pnl = (current - entry) if side == 0 else (entry - current)
+
                             if pnl <= 0:
                                 state.session_losses[sym] += 1
                                 result = "LOSS"
                             else:
-                                state.session_losses[sym] = 0  # Reset on win
+                                state.session_losses[sym] = 0
                                 result = "WIN"
-                            
+
                             losses = state.session_losses[sym]
                             stopped = " — STOPPED for session" if losses >= 3 else ""
-                            print(f"  [{sym}] Position CLOSED ({result}) | "
+                            print(f"  [{sym}] {level} CLOSED ({result}) | "
                                   f"Consecutive losses: {losses}{stopped}")
-                            del state.active_position[sym]
-                except Exception as e:
-                    pass  # Non-fatal
+                            del state.active_positions[key]
+                            break  # Re-check next cycle
+                except:
+                    pass
                 try:
                     et_now = datetime.now(ET)
                     if et_now.minute == 0:
                         print(f"\n  [{et_now.strftime('%H:%M')}] {state.mode} mode")
                         for sym in SYMBOLS:
-                            cdm = state.cdm.get(sym)
                             price = state.current_price.get(sym)
-                            cdm_s = f"{cdm:.2f}" if cdm else "?"
                             price_s = f"{price:.2f}" if price else "?"
-                            status = "POSITION" if sym in state.active_position else \
-                                     "PENDING" if sym in state.pending_entry else ""
-                            print(f"    {sym}: price={price_s} cdm={cdm_s} {status}")
+                            cdm_s = f"{state.cdm.get(sym):.2f}" if state.cdm.get(sym) else "-"
+                            pdm_s = f"{state.pdm.get(sym):.2f}" if state.pdm.get(sym) else "-"
+                            cmm_s = f"{state.cmm.get(sym):.2f}" if state.cmm.get(sym) else "-"
+                            pmm_s = f"{state.pmm.get(sym):.2f}" if state.pmm.get(sym) else "-"
+                            pending = [k[1] for k in state.pending_entries if k[0] == sym]
+                            active = [k[1] for k in state.active_positions if k[0] == sym]
+                            losses = state.session_losses.get(sym, 0)
+                            loss_s = f" ({losses}L)" if losses else ""
+                            print(f"    {sym}: {price_s} | CDM:{cdm_s} PDM:{pdm_s} CMM:{cmm_s} PMM:{pmm_s}")
+                            if pending: print(f"      Pending: {', '.join(pending)}")
+                            if active: print(f"      Active: {', '.join(active)}")
+                            if losses >= 3: print(f"      STOPPED for session")
                 except:
                     pass
 
