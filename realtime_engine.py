@@ -70,6 +70,8 @@ class State:
         self.month_closes = defaultdict(list)  # {(symbol, year, month): [closes]}
         self.pending_entry = {}   # {symbol: {order_id, entry_price, ...}}
         self.active_position = {} # {symbol: {entry, stop, target, ...}}
+        self.session_losses = defaultdict(int)  # {symbol: consecutive loss count}
+        self.session_day = None   # Track which session day we're in
         self.current_day = None
         self.current_month = None
 
@@ -294,6 +296,16 @@ async def on_new_bar(symbol, bar_data, client, account):
 
         mode = state.mode
 
+        # Reset loss counter on new session day
+        today = get_futures_day(datetime.now(CT))
+        if state.session_day != today:
+            state.session_losses.clear()
+            state.session_day = today
+
+        # 3 consecutive losses = stop trading this symbol for the session
+        if state.session_losses[symbol] >= 3:
+            return
+
         # DUPLICATE PREVENTION
         if symbol in state.active_position:
             return
@@ -501,9 +513,53 @@ async def main(mode: str, dry_run: bool = False):
             print(f"  STREAMING — {state.mode} mode on MNQ, MES, MYM")
             print(f"  Ctrl+C to stop\n")
 
-            # Keep alive + hourly status
+            # Keep alive + monitor positions + hourly status
             while True:
                 await asyncio.sleep(60)
+
+                # Check if any active positions were closed (stop/target hit)
+                try:
+                    import aiohttp
+                    token = client.get_session_token()
+                    base_url = client.base_url
+                    api_h = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+                    async with aiohttp.ClientSession() as http:
+                        async with http.post(f'{base_url}/Position/searchOpen',
+                                             json={'accountId': account.id}, headers=api_h) as resp:
+                            open_positions = await resp.json()
+                            open_syms = set()
+                            for p in open_positions.get('positions', []):
+                                cid = p.get('contractId', '')
+                                parts = cid.split('.')
+                                if len(parts) >= 4:
+                                    open_syms.add(parts[3])
+
+                    for sym in list(state.active_position.keys()):
+                        if sym not in open_syms:
+                            pos = state.active_position[sym]
+                            # Position closed — determine if win or loss
+                            current = state.current_price.get(sym, 0)
+                            entry = pos.get('entry', 0)
+                            side = pos.get('side', 1)
+                            if side == 0:  # BUY
+                                pnl = current - entry
+                            else:  # SELL
+                                pnl = entry - current
+                            
+                            if pnl <= 0:
+                                state.session_losses[sym] += 1
+                                result = "LOSS"
+                            else:
+                                state.session_losses[sym] = 0  # Reset on win
+                                result = "WIN"
+                            
+                            losses = state.session_losses[sym]
+                            stopped = " — STOPPED for session" if losses >= 3 else ""
+                            print(f"  [{sym}] Position CLOSED ({result}) | "
+                                  f"Consecutive losses: {losses}{stopped}")
+                            del state.active_position[sym]
+                except Exception as e:
+                    pass  # Non-fatal
                 try:
                     et_now = datetime.now(ET)
                     if et_now.minute == 0:
