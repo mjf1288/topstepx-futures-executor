@@ -263,7 +263,9 @@ async def on_new_bar(symbol, bar_data, client, account):
         if et_now.weekday() == 6 and et_now.hour < 22:
             return
 
-        mode = state.mode
+        mode = state.modes.get(symbol)
+        if not mode:
+            return  # This symbol isn't active
 
         # Reset loss counter on new session day
         today = get_futures_day(datetime.now(CT))
@@ -323,7 +325,11 @@ def seed_historical(client):
     prev_start = session_start - timedelta(days=1)
     prev_start_utc = prev_start.astimezone(timezone.utc)
 
-    for sym in SYMBOLS:
+    active = list(state.modes.keys()) if hasattr(state, 'modes') and state.modes else SYMBOLS
+    for sym in active:
+        if sym not in CONTRACT_MAP:
+            print(f"  {sym}: unknown contract, skipping")
+            continue
         curr, prior, tick, tick_val = CONTRACT_MAP[sym]
 
         # Today's 5-min bars (from session start)
@@ -400,20 +406,21 @@ def seed_historical(client):
 # ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
-async def main(mode: str, dry_run: bool = False):
+async def main(modes: dict, dry_run: bool = False):
     from project_x_py import ProjectX, TradingSuite, EventType
 
-    state.mode = mode.upper()
+    state.modes = modes  # {symbol: 'BUY'/'SELL'}
     state.dry_run = dry_run
-    mode_display = f"{state.mode} {'(DRY RUN)' if dry_run else '(LIVE)'}"
+    active_syms = list(modes.keys())
+    mode_lines = '  '.join(f"{s}:{m}" for s, m in modes.items())
+    live_str = 'DRY RUN' if dry_run else 'LIVE'
 
     print(f"""
-╔═══════════════════════════════════════════════════╗
-║  Tzu Strategic Momentum                           ║
-║  Mode: {mode_display:<42}║
-║  Instruments: MNQ, MES, MYM                      ║
-║  Stops: {ATR_MULTIPLIER}x ATR | R:R 1:{RR_RATIO}                        ║
-╚═══════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════╗
+║  Tzu Strategic Momentum  ({live_str})                  
+║  {mode_lines:<52}║
+║  Stops: {ATR_MULTIPLIER}x ATR | R:R 1:{RR_RATIO} | 1 order per level         ║
+╚═══════════════════════════════════════════════════════╝
 """)
 
     try:
@@ -428,9 +435,9 @@ async def main(mode: str, dry_run: bool = False):
             seed_historical(client)
             print(f"  Ready.\n")
 
-            # Create one TradingSuite per instrument
+            # Create one TradingSuite per active instrument
             suites = []
-            for sym in SYMBOLS:
+            for sym in active_syms:
                 suite = await TradingSuite.create(instruments=[sym], timeframes=["5min"])
 
                 def make_callback(symbol):
@@ -453,7 +460,7 @@ async def main(mode: str, dry_run: bool = False):
                 await suite.on(EventType.NEW_BAR, make_callback(sym))
                 suites.append(suite)
 
-            print(f"  STREAMING — {state.mode} mode on MNQ, MES, MYM")
+            print(f"  STREAMING — {mode_lines}")
             print(f"  Ctrl+C to stop\n")
 
             # Keep alive + monitor positions + hourly status
@@ -508,8 +515,8 @@ async def main(mode: str, dry_run: bool = False):
                 try:
                     et_now = datetime.now(ET)
                     if et_now.minute == 0:
-                        print(f"\n  [{et_now.strftime('%H:%M')}] {state.mode} mode")
-                        for sym in SYMBOLS:
+                        print(f"\n  [{et_now.strftime('%H:%M')}] Status")
+                        for sym in active_syms:
                             price = state.current_price.get(sym)
                             price_s = f"{price:.2f}" if price else "?"
                             cdm_s = f"{state.cdm.get(sym):.2f}" if state.cdm.get(sym) else "-"
@@ -520,7 +527,8 @@ async def main(mode: str, dry_run: bool = False):
                             active = [k[1] for k in state.active_positions if k[0] == sym]
                             losses = state.session_losses.get(sym, 0)
                             loss_s = f" ({losses}L)" if losses else ""
-                            print(f"    {sym}: {price_s} | CDM:{cdm_s} PDM:{pdm_s} CMM:{cmm_s} PMM:{pmm_s}")
+                            sym_mode = state.modes.get(sym, '?')
+                            print(f"    {sym} [{sym_mode}]: {price_s} | CDM:{cdm_s} PDM:{pdm_s} CMM:{cmm_s} PMM:{pmm_s}")
                             if pending: print(f"      Pending: {', '.join(pending)}")
                             if active: print(f"      Active: {', '.join(active)}")
                             if losses >= 3: print(f"      STOPPED for session")
@@ -536,8 +544,36 @@ async def main(mode: str, dry_run: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Tzu Strategic Momentum")
-    parser.add_argument("--mode", required=True, choices=["buy", "sell"], help="BUY or SELL mode")
+    parser = argparse.ArgumentParser(
+        description="Tzu Strategic Momentum",
+        epilog="""Examples:
+  All instruments SELL:   python realtime_engine.py --mode sell
+  All instruments BUY:    python realtime_engine.py --mode buy
+  Per-instrument:         python realtime_engine.py --mnq sell --mes buy --mym sell --mgc buy
+  Mix (some off):         python realtime_engine.py --mnq sell --mes sell
+  Dry run:                python realtime_engine.py --mode sell --dry-run""",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--mode", choices=["buy", "sell"], help="Set ALL instruments to BUY or SELL")
+    parser.add_argument("--mnq", choices=["buy", "sell"], help="MNQ mode")
+    parser.add_argument("--mes", choices=["buy", "sell"], help="MES mode")
+    parser.add_argument("--mym", choices=["buy", "sell"], help="MYM mode")
+    parser.add_argument("--mgc", choices=["buy", "sell"], help="MGC mode")
     parser.add_argument("--dry-run", action="store_true", help="Show without executing")
     args = parser.parse_args()
-    asyncio.run(main(mode=args.mode, dry_run=args.dry_run))
+
+    # Build per-instrument mode map
+    modes = {}
+    if args.mode:
+        for sym in SYMBOLS:
+            modes[sym] = args.mode.upper()
+    # Per-instrument overrides
+    if args.mnq: modes['MNQ'] = args.mnq.upper()
+    if args.mes: modes['MES'] = args.mes.upper()
+    if args.mym: modes['MYM'] = args.mym.upper()
+    if args.mgc: modes['MGC'] = args.mgc.upper()
+
+    if not modes:
+        parser.error("Specify --mode for all, or per-instrument flags (--mnq, --mes, --mym, --mgc)")
+
+    asyncio.run(main(modes=modes, dry_run=args.dry_run))
