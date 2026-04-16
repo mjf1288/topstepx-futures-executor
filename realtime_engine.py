@@ -48,8 +48,9 @@ CONTRACT_MAP = {
 }
 
 MAX_CONTRACTS_PER_INSTRUMENT = 4  # One per level (CDM, PDM, CMM, PMM)
+CONTRACTS_PER_ORDER = 2            # Size per entry order
 
-ATR_MULTIPLIER = 1.0
+ATR_MULTIPLIER = 4.0   # 4x 5min ATR → ~130pts MNQ, ~25pts MES
 RR_RATIO = 2.0
 
 ET = pytz.timezone("America/New_York")
@@ -203,7 +204,7 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
         # Place entry
         r = await (await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
-            'type': 1, 'side': side, 'size': 1, 'limitPrice': entry_price,
+            'type': 1, 'side': side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': entry_price,
         }, headers=hdrs)).json()
         if not r.get('success'):
             print(f"  [{symbol}] {level_name} entry failed: {r}")
@@ -213,14 +214,14 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
         # Place stop
         r_stop = await (await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
-            'type': 4, 'side': stop_side, 'size': 1, 'stopPrice': stop,
+            'type': 4, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'stopPrice': stop,
         }, headers=hdrs)).json()
         stop_id = r_stop.get('orderId')
 
         # Place target
         r_tp = await (await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
-            'type': 1, 'side': stop_side, 'size': 1, 'limitPrice': target,
+            'type': 1, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': target,
         }, headers=hdrs)).json()
         target_id = r_tp.get('orderId')
 
