@@ -284,15 +284,61 @@ async def on_new_bar(symbol, bar_data, client, account):
 
         side = 0 if mode == 'BUY' else 1
 
+        # ── POSITION + ORDER GUARD (API-level, prevents duplicates across restarts) ──
+        import aiohttp
+        token = client.get_session_token()
+        base_url = client.base_url
+        hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+        # Count open positions for this instrument
+        open_pos_count = 0
+        try:
+            async with aiohttp.ClientSession() as http:
+                resp = await http.get(f'{base_url}/Position/searchOpen', params={'accountId': account.id}, headers=hdrs)
+                pos_data = await resp.json()
+                if isinstance(pos_data, list):
+                    for p in pos_data:
+                        if p.get('contractId', '') == contract_id:
+                            open_pos_count += abs(p.get('size', 0))
+        except:
+            pass
+
+        # Count open limit orders for this instrument (entry orders only, type=1=Limit)
+        open_order_count = 0
+        existing_order_prices = set()
+        try:
+            async with aiohttp.ClientSession() as http:
+                resp = await http.get(f'{base_url}/Order/searchOpen', params={'accountId': account.id}, headers=hdrs)
+                ord_data = await resp.json()
+                if isinstance(ord_data, list):
+                    for o in ord_data:
+                        if o.get('contractId', '') == contract_id and o.get('type') == 1 and o.get('side') == side:
+                            open_order_count += 1
+                            if o.get('limitPrice'):
+                                existing_order_prices.add(round(o['limitPrice'], 2))
+        except:
+            pass
+
+        total_exposure = open_pos_count + open_order_count
+        if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
+            return  # Already at max — no new orders
+
         # Place/update at ALL eligible levels (1 order per level)
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
         for level_name, entry_price in eligible:
+            # Check total exposure again (could have added in this loop)
+            if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
+                break
             key = (symbol, level_name)
             if key in state.active_positions:
                 continue  # Already filled at this level
+            # Skip if we already have a limit order at this price
+            if round(entry_price, 2) in existing_order_prices:
+                continue
             # Place new or update existing
             await place_or_update_entry(client, account, symbol, level_name,
                                         contract_id, side, entry_price, tick_size)
+            total_exposure += 1
 
     except Exception as e:
         print(f"  [{symbol}] Error (non-fatal): {e}")
