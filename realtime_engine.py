@@ -254,13 +254,11 @@ async def on_new_bar(symbol, bar_data, client, account):
         if not cdm:
             return
 
-        # Time filter: no orders 6-10 PM ET (CDM building)
+        # Weekend filter only (market closed)
         et_now = datetime.now(ET)
-        if 18 <= et_now.hour < 22:
-            return
         if (et_now.weekday() == 4 and et_now.hour >= 18) or et_now.weekday() == 5:
             return
-        if et_now.weekday() == 6 and et_now.hour < 22:
+        if et_now.weekday() == 6 and et_now.hour < 18:
             return
 
         mode = state.modes.get(symbol)
