@@ -1,4 +1,62 @@
 {
-  "pending_limits": {},
-  "last_updated": "2026-04-01T13:07:00.646977"
+  "pending_limits": {
+    "MNQ_CDM": {
+      "entry_order_id": 2753500799,
+      "stop_order_id": 2753500806,
+      "target_order_id": 2753500813,
+      "level": "CDM",
+      "strength": 2,
+      "side": 1,
+      "side_str": "SELL",
+      "entry": 23794.75,
+      "stop": 24384.25,
+      "target": 22616.0,
+      "dollar_risk": 1178.857142,
+      "dollar_target": 2357.714284,
+      "atr_mult_used": 1.0,
+      "dist_pct": 0.15,
+      "symbol": "MNQ",
+      "contract_id": "CON.F.US.MNQ.M26",
+      "placed_at": "2026-04-02T01:50:06.780620-04:00"
+    },
+    "MES_CDM": {
+      "entry_order_id": 2753500929,
+      "stop_order_id": 2753500932,
+      "target_order_id": 2753500953,
+      "level": "CDM",
+      "strength": 2,
+      "side": 1,
+      "side_str": "SELL",
+      "entry": 6531.5,
+      "stop": 6669.5,
+      "target": 6255.75,
+      "dollar_risk": 689.375,
+      "dollar_target": 1378.75,
+      "atr_mult_used": 1.0,
+      "dist_pct": 0.13,
+      "symbol": "MES",
+      "contract_id": "CON.F.US.MES.M26",
+      "placed_at": "2026-04-02T01:50:06.780620-04:00"
+    },
+    "MYM_CDM": {
+      "entry_order_id": 2753501055,
+      "stop_order_id": 2753501059,
+      "target_order_id": 2753501066,
+      "level": "CDM",
+      "strength": 2,
+      "side": 1,
+      "side_str": "SELL",
+      "entry": 46291,
+      "stop": 47217,
+      "target": 44439,
+      "dollar_risk": 463.0,
+      "dollar_target": 926.0,
+      "atr_mult_used": 1.0,
+      "dist_pct": 0.11,
+      "symbol": "MYM",
+      "contract_id": "CON.F.US.MYM.M26",
+      "placed_at": "2026-04-02T01:50:06.780620-04:00"
+    }
+  },
+  "last_updated": "2026-04-02T05:50:13.869409"
 }
