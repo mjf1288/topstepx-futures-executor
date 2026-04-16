@@ -429,19 +429,20 @@ def seed_historical(client):
             state.pmm[sym] = sum(month_data[prev_m]) / len(month_data[prev_m])
             print(f"  {sym} PMM: {state.pmm[sym]:.2f}")
 
-        # ATR from daily bars
-        daily = sync_requests.post(f'{base_url}/History/retrieveBars', json={
-            "contractId": curr, "live": False,
-            "startTime": (now_utc - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "unit": 4, "unitNumber": 1, "limit": 500, "includePartialBar": True,
-        }, headers=headers).json().get('bars', [])
-        daily.sort(key=lambda x: x['t'])
+        # ATR from 5-min bars (intraday stops, not daily)
+        all_5min = bars_yesterday + bars_today
+        all_5min.sort(key=lambda x: x['t'])
 
-        if len(daily) >= 15:
-            trs = [daily[i]['h'] - daily[i]['l'] for i in range(-14, 0)]
+        if len(all_5min) >= 50:
+            trs = []
+            for i in range(-50, 0):
+                h = all_5min[i]['h']
+                l = all_5min[i]['l']
+                pc = all_5min[i-1]['c']
+                tr = max(h - l, abs(h - pc), abs(l - pc))
+                trs.append(tr)
             state.atr[sym] = sum(trs) / len(trs)
-            print(f"  {sym} ATR: {state.atr[sym]:.2f}")
+            print(f"  {sym} ATR(50x5min): {state.atr[sym]:.2f}")
 
     state.current_day = today
     state.current_month = this_month
