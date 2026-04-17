@@ -430,25 +430,27 @@ def seed_historical(client):
             state.pmm[sym] = sum(month_data[prev_m]) / len(month_data[prev_m])
             print(f"  {sym} PMM: {state.pmm[sym]:.2f}")
 
-        # ATR from daily bars
+        # ATR from last 3 trading days (adapts to recent volatility)
         daily = sync_requests.post(f'{base_url}/History/retrieveBars', json={
             "contractId": curr, "live": False,
-            "startTime": (now_utc - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "startTime": (now_utc - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "unit": 4, "unitNumber": 1, "limit": 500, "includePartialBar": True,
         }, headers=headers).json().get('bars', [])
         daily.sort(key=lambda x: x['t'])
 
-        if len(daily) >= 15:
+        if len(daily) >= 4:
             trs = []
-            for i in range(-14, 0):
+            for i in [-3, -2, -1]:
                 h = daily[i]['h']
                 l = daily[i]['l']
                 pc = daily[i-1]['c']
                 tr = max(h - l, abs(h - pc), abs(l - pc))
                 trs.append(tr)
             state.atr[sym] = sum(trs) / len(trs)
-            print(f"  {sym} ATR: {state.atr[sym]:.2f}")
+            stop_pts = state.atr[sym] * ATR_MULTIPLIER
+            target_pts = stop_pts * RR_RATIO
+            print(f"  {sym} ATR(3d): {state.atr[sym]:.2f} | stop: {stop_pts:.1f}pts | target: {target_pts:.1f}pts")
 
     state.current_day = today
     state.current_month = this_month
