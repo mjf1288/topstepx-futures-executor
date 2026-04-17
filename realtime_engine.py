@@ -47,11 +47,11 @@ CONTRACT_MAP = {
     'MGC': ('CON.F.US.MGC.M26', 'CON.F.US.MGC.J26', 0.10, 1.00),
 }
 
-MAX_CONTRACTS_PER_INSTRUMENT = 4  # One per level (CDM, PDM, CMM, PMM)
-CONTRACTS_PER_ORDER = 2            # Size per entry order
+MAX_CONTRACTS_PER_INSTRUMENT = 2  # Hard max 2 contracts per instrument
+CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 
-ATR_MULTIPLIER = 1.0
-RR_RATIO = 2.0
+ATR_MULTIPLIER = 0.382             # ~38.2% of daily ATR (fib-based tight stop)
+RR_RATIO = 2.618                   # Golden ratio R:R
 
 ET = pytz.timezone("America/New_York")
 CT = pytz.timezone("America/Chicago")
