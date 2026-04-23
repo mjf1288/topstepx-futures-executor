@@ -137,7 +137,14 @@ def update_running_means(symbol, close, timestamp):
 
 
 def get_all_eligible_levels(symbol, mode, price, tick_size):
-    """Get ALL mean levels eligible for entry in the given mode."""
+    """Get all mean levels eligible for entry in the given mode.
+
+    A BUY LIMIT must be BELOW current price (else fills instantly at market).
+    A SELL LIMIT must be ABOVE current price (same reason).
+
+    The engine re-checks every 5-min bar, so as price moves, new levels
+    become eligible and get orders placed automatically.
+    """
     levels = {
         'CDM': state.cdm.get(symbol),
         'PDM': state.pdm.get(symbol),
@@ -439,21 +446,28 @@ def seed_historical(client):
             continue
         curr, prior, tick, tick_val = CONTRACT_MAP[sym]
 
-        # Today's 5-min bars (from session start)
-        bars_today = sync_requests.post(f'{base_url}/History/retrieveBars', json={
-            "contractId": curr, "live": False,
-            "startTime": session_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "unit": 1, "unitNumber": 5, "limit": 5000, "includePartialBar": True,
-        }, headers=headers).json().get('bars', [])
-
-        # Yesterday's 5-min bars
-        bars_yesterday = sync_requests.post(f'{base_url}/History/retrieveBars', json={
+        # Fetch a wide window and filter locally — the History API
+        # does not reliably respect startTime, so we bucket bars by timestamp.
+        # unit=2 is MINUTE (unit=1 is Second, which is what we were wrongly using)
+        all_bars = sync_requests.post(f'{base_url}/History/retrieveBars', json={
             "contractId": curr, "live": False,
             "startTime": prev_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "endTime": session_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "unit": 1, "unitNumber": 5, "limit": 5000, "includePartialBar": True,
+            "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "unit": 2, "unitNumber": 5, "limit": 5000, "includePartialBar": True,
         }, headers=headers).json().get('bars', [])
+
+        # Filter by timestamp into today's vs yesterday's session
+        bars_today = []
+        bars_yesterday = []
+        for b in all_bars:
+            try:
+                ts = datetime.fromisoformat(b['t'].replace('Z', '+00:00'))
+            except Exception:
+                continue
+            if ts >= session_start_utc:
+                bars_today.append(b)
+            elif ts >= prev_start_utc:
+                bars_yesterday.append(b)
 
         # CDM
         if bars_today:
