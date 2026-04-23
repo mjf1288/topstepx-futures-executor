@@ -196,12 +196,13 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
         print(f"  [{symbol}] DRY: {side_str} {level_name} @ {entry_price} | stop {stop} | target {target}")
         state.pending_entries[key] = {'order_id': 'DRY', 'entry_price': entry_price,
             'side': side, 'contract_id': contract_id, 'stop': stop, 'target': target,
-            'level': level_name}
+            'level': level_name, 'bracketed': False}
         return
 
-    stop_side = 1 if side == 0 else 0
+    # ── ENTRY ONLY. Brackets (stop + target) are placed by check_and_bracket()
+    # AFTER the entry fills. This prevents the broker from treating the target
+    # LIMIT as a standalone short (or long) that triggers on the way to entry.
     async with aiohttp.ClientSession() as http:
-        # Place entry
         r = await (await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
             'type': 1, 'side': side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': entry_price,
@@ -211,29 +212,87 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
             return
         entry_id = r['orderId']
 
-        # Place stop
-        r_stop = await (await http.post(f'{base_url}/Order/place', json={
-            'accountId': account.id, 'contractId': contract_id,
-            'type': 4, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'stopPrice': stop,
-        }, headers=hdrs)).json()
-        stop_id = r_stop.get('orderId')
-
-        # Place target
-        r_tp = await (await http.post(f'{base_url}/Order/place', json={
-            'accountId': account.id, 'contractId': contract_id,
-            'type': 1, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': target,
-        }, headers=hdrs)).json()
-        target_id = r_tp.get('orderId')
-
     state.pending_entries[key] = {
-        'order_id': entry_id, 'stop_id': stop_id, 'target_id': target_id,
+        'order_id': entry_id, 'stop_id': None, 'target_id': None,
         'entry_price': entry_price, 'stop': stop, 'target': target,
         'side': side, 'contract_id': contract_id, 'level': level_name,
+        'bracketed': False,  # True once stop+target are placed post-fill
     }
-    print(f"  [{symbol}] {side_str} {level_name} @ {entry_price} | stop {stop} | target {target}")
+    print(f"  [{symbol}] {side_str} {level_name} @ {entry_price} (stop {stop} / target {target} — bracket on fill)")
 
 
-# Brackets are now placed WITH the entry — no separate fill check needed
+# ─────────────────────────────────────────────────────────────
+async def check_and_bracket_fills(client, account):
+    """Poll for filled entries that don't yet have brackets attached.
+    Places stop + target immediately upon fill detection."""
+    import aiohttp
+    if state.dry_run:
+        return
+    token = client.get_session_token()
+    base_url = client.base_url
+    hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    # Get current positions from API to detect fills
+    try:
+        async with aiohttp.ClientSession() as http:
+            resp = await http.get(f'{base_url}/Position/searchOpen',
+                                  params={'accountId': account.id}, headers=hdrs)
+            positions = await resp.json()
+    except Exception:
+        return
+    if not isinstance(positions, list):
+        return
+
+    # Build a map: contractId -> (side, size, avgPrice)
+    pos_map = {}
+    for p in positions:
+        cid = p.get('contractId', '')
+        pos_map.setdefault(cid, []).append({
+            'type': p.get('type'),  # 1=LONG, 2=SHORT
+            'size': abs(p.get('size', 0)),
+            'avg_price': p.get('averagePrice', 0),
+        })
+
+    # For each pending entry without brackets, check if it filled
+    for key, pend in list(state.pending_entries.items()):
+        if pend.get('bracketed'):
+            continue
+        sym, level_name = key
+        cid = pend['contract_id']
+        side = pend['side']
+        expected_pos_type = 1 if side == 0 else 2  # 1=LONG for BUY, 2=SHORT for SELL
+
+        # Look for a matching open position — fill detected if one exists
+        fills = pos_map.get(cid, [])
+        matching = [f for f in fills if f['type'] == expected_pos_type]
+        if not matching:
+            continue
+
+        # Fill detected → place bracket NOW
+        stop_side = 1 if side == 0 else 0
+        stop = pend['stop']
+        target = pend['target']
+
+        try:
+            async with aiohttp.ClientSession() as http:
+                r_stop = await (await http.post(f'{base_url}/Order/place', json={
+                    'accountId': account.id, 'contractId': cid,
+                    'type': 4, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'stopPrice': stop,
+                }, headers=hdrs)).json()
+                stop_id = r_stop.get('orderId')
+
+                r_tp = await (await http.post(f'{base_url}/Order/place', json={
+                    'accountId': account.id, 'contractId': cid,
+                    'type': 1, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': target,
+                }, headers=hdrs)).json()
+                target_id = r_tp.get('orderId')
+
+            pend['stop_id'] = stop_id
+            pend['target_id'] = target_id
+            pend['bracketed'] = True
+            print(f"  [{sym}] {level_name} FILLED → bracket placed (stop {stop} / target {target})")
+        except Exception as e:
+            print(f"  [{sym}] {level_name} bracket placement failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -247,6 +306,9 @@ async def on_new_bar(symbol, bar_data, client, account):
 
         state.current_price[symbol] = close
         update_running_means(symbol, close, bar_data['timestamp'])
+
+        # Check for fills on pending entries and attach brackets
+        await check_and_bracket_fills(client, account)
 
         cdm = state.cdm.get(symbol)
         cdm_str = f"{cdm:.2f}" if cdm else "?"
