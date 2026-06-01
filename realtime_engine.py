@@ -47,7 +47,7 @@ CONTRACT_MAP = {
     'MGC': ('CON.F.US.MGC.M26', 'CON.F.US.MGC.J26', 0.10, 1.00),
 }
 
-MAX_CONTRACTS_PER_INSTRUMENT = 2  # Hard max 2 contracts per instrument
+MAX_CONTRACTS_PER_INSTRUMENT = 3  # Hard max contracts per instrument (positions + working entries)
 CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 
 ATR_MULTIPLIER = 0.382             # ~38.2% of daily ATR (fib-based tight stop)
@@ -412,24 +412,48 @@ async def on_new_bar(symbol, bar_data, client, account):
 
         total_exposure = open_pos_count + open_order_count
         if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
+            print(f"  [{symbol}] AT CAP — {open_pos_count} pos + {open_order_count} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}, no new orders")
             return  # Already at max — no new orders
 
-        # Place/update at ALL eligible levels (1 order per level)
+        # Place/update at ALL eligible levels (1 order per level).
+        # IMPORTANT: re-query position count BETWEEN placements within the
+        # same scan cycle so a fill that lands mid-loop is reflected before
+        # we add the next entry. Prior bug: optimistic local counter
+        # (total_exposure += 1) diverged from broker reality and let MNQ
+        # accumulate 9 contracts overnight as multiple levels cascaded.
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
         for level_name, entry_price in eligible:
-            # Check total exposure again (could have added in this loop)
-            if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
-                break
             key = (symbol, level_name)
             if key in state.active_positions:
                 continue  # Already filled at this level
             # Skip if we already have a limit order at this price
             if round(entry_price, 2) in existing_order_prices:
                 continue
-            # Place new or update existing
+
+            # Re-query exposure from broker BEFORE placing (covers fills
+            # that happened since this scan cycle started)
+            try:
+                async with aiohttp.ClientSession() as http:
+                    pr = await http.get(f'{base_url}/Position/searchOpen', params={'accountId': account.id}, headers=hdrs)
+                    pdata = await pr.json()
+                    live_pos = sum(abs(p.get('size', 0)) for p in (pdata or [])
+                                   if p.get('contractId', '') == contract_id) if isinstance(pdata, list) else open_pos_count
+                    orr = await http.get(f'{base_url}/Order/searchOpen', params={'accountId': account.id}, headers=hdrs)
+                    odata = await orr.json()
+                    live_orders = sum(1 for o in (odata or [])
+                                      if o.get('contractId', '') == contract_id
+                                      and o.get('type') == 1 and o.get('side') == side) if isinstance(odata, list) else open_order_count
+                    live_exposure = live_pos + live_orders
+            except Exception:
+                live_exposure = total_exposure  # fallback
+
+            if live_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
+                print(f"  [{symbol}] CAP HIT mid-cycle — {live_pos} pos + {live_orders} working = {live_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}, halting placements")
+                break
+
             await place_or_update_entry(client, account, symbol, level_name,
                                         contract_id, side, entry_price, tick_size)
-            total_exposure += 1
+            total_exposure = live_exposure + 1
 
     except Exception as e:
         print(f"  [{symbol}] Error (non-fatal): {e}")
