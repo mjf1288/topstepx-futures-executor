@@ -53,6 +53,13 @@ CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 ATR_MULTIPLIER = 0.382             # ~38.2% of daily ATR (fib-based tight stop)
 RR_RATIO = 2.618                   # Golden ratio R:R
 
+# Running-mean warm-up gates. The mean is statistically meaningless
+# with too few samples — at globex open on a new month, a 1-sample CMM
+# equals current price and triggers instant-fill limits with no edge.
+# Observed bug: 2026-06-01 globex open filled at CMM on first 5m bar.
+MIN_SAMPLES_CDM = 6   # ~30 min of 5-min bars before publishing CDM
+MIN_SAMPLES_CMM = 24  # ~2 hours into a new month before publishing CMM
+
 ET = pytz.timezone("America/New_York")
 CT = pytz.timezone("America/Chicago")
 
@@ -132,8 +139,22 @@ def update_running_means(symbol, close, timestamp):
     state.month_closes[month_key].append(close)
 
     # Compute running means
-    state.cdm[symbol] = sum(state.day_closes[day_key]) / len(state.day_closes[day_key])
-    state.cmm[symbol] = sum(state.month_closes[month_key]) / len(state.month_closes[month_key])
+    # ── Warm-up gates ──
+    # At day/month boundaries, the running mean is statistically meaningless
+    # for the first few samples. A 1-sample CMM at globex open on the 1st of
+    # the month equals current price, so placing a limit at CMM would fill
+    # instantly with zero edge — the exact bug observed on 2026-06-01.
+    # Require a minimum sample count before publishing each mean.
+    day_count = len(state.day_closes[day_key])
+    month_count = len(state.month_closes[month_key])
+    if day_count >= MIN_SAMPLES_CDM:
+        state.cdm[symbol] = sum(state.day_closes[day_key]) / day_count
+    else:
+        state.cdm[symbol] = None  # not enough data yet — skip CDM signals
+    if month_count >= MIN_SAMPLES_CMM:
+        state.cmm[symbol] = sum(state.month_closes[month_key]) / month_count
+    else:
+        state.cmm[symbol] = None  # warm-up after month roll
 
 
 def get_all_eligible_levels(symbol, mode, price, tick_size):

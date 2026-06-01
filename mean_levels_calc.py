@@ -72,6 +72,7 @@ def calc_period_mean(closes: list[float], groups: list) -> dict:
         'current': round(buff, 4),
         'prev': round(prev_tf_buff, 4) if prev_tf_buff is not None else round(buff, 4),
         'dir': 'UP' if direction == 1 else 'DOWN',
+        'count': count,  # # of samples in the current group (warm-up gate)
     }
 
 
@@ -132,6 +133,19 @@ def compute_mean_levels(
     cmm = monthly_mean['current']  # Current Month Mean
     pmm = monthly_mean['prev']     # Previous Month Mean
     cmm_dir = monthly_mean['dir']
+
+    # Warm-up gates: a running mean with too few samples in the current
+    # period equals (or is dominated by) the current price. Placing limits
+    # at such a CMM/CDM = instant-fill with no edge. The thresholds below
+    # require enough samples that the mean is statistically distinct from
+    # the current price. Observed bug: 2026-06-01 globex open filled at CMM
+    # on the first 5m bar of June.
+    MIN_DAILY_SAMPLES = 6     # ~30 min of 5m bars before CDM is meaningful
+    MIN_MONTHLY_SAMPLES = 24  # ~2 hours of 5m bars into a new month
+    if daily_mean.get('count', 0) < MIN_DAILY_SAMPLES:
+        cdm = None
+    if monthly_mean.get('count', 0) < MIN_MONTHLY_SAMPLES:
+        cmm = None
 
     # Get today/yesterday high-low for classify_setup
     dates = df.select("date").unique().sort("date").to_series().to_list()
