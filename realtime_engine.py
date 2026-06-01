@@ -456,9 +456,21 @@ def seed_historical(client):
         session_start = (now_ct - timedelta(days=1)).replace(hour=17, minute=0, second=0, microsecond=0)
     session_start_utc = session_start.astimezone(timezone.utc)
 
-    # Previous session
+    # Previous TRADING session start. CME futures close Fri 4pm CT, reopen Sun 5pm CT.
+    # So on a Monday morning the previous session is Friday, not Sunday.
+    # We walk back day-by-day skipping Sat (weekday=5) and Sun (weekday=6),
+    # also handling Monday holidays by extending the search window.
     prev_start = session_start - timedelta(days=1)
+    # If prev_start lands on Saturday (weekday=5) or Sunday (weekday=6),
+    # walk back to Friday.
+    while prev_start.weekday() >= 5:
+        prev_start -= timedelta(days=1)
     prev_start_utc = prev_start.astimezone(timezone.utc)
+    # Pull a wider window so a Monday holiday (Memorial Day, Labor Day,
+    # July 4, etc.) doesn't leave PDM empty — we'll fall back to the
+    # most recent session with actual bars.
+    fetch_start = prev_start - timedelta(days=4)
+    fetch_start_utc = fetch_start.astimezone(timezone.utc)
 
     active = list(state.modes.keys()) if hasattr(state, 'modes') and state.modes else SYMBOLS
     for sym in active:
@@ -472,14 +484,17 @@ def seed_historical(client):
         # unit=2 is MINUTE (unit=1 is Second, which is what we were wrongly using)
         all_bars = sync_requests.post(f'{base_url}/History/retrieveBars', json={
             "contractId": curr, "live": False,
-            "startTime": prev_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "startTime": fetch_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "unit": 2, "unitNumber": 5, "limit": 5000, "includePartialBar": True,
         }, headers=headers).json().get('bars', [])
 
-        # Filter by timestamp into today's vs yesterday's session
+        # Bucket bars by FUTURES TRADING DAY (5pm CT roll). This handles
+        # weekends and holidays automatically — days with no bars don't
+        # appear as buckets at all, so 'previous trading day' = whichever
+        # bucket is one before today.
         bars_today = []
-        bars_yesterday = []
+        bars_by_day = defaultdict(list)
         for b in all_bars:
             try:
                 ts = datetime.fromisoformat(b['t'].replace('Z', '+00:00'))
@@ -487,8 +502,11 @@ def seed_historical(client):
                 continue
             if ts >= session_start_utc:
                 bars_today.append(b)
-            elif ts >= prev_start_utc:
-                bars_yesterday.append(b)
+            else:
+                # Group by futures trading day in CT
+                ts_ct = ts.astimezone(CT)
+                fday = get_futures_day(ts_ct)
+                bars_by_day[fday].append(b)
 
         # CDM
         if bars_today:
@@ -497,11 +515,16 @@ def seed_historical(client):
             state.cdm[sym] = sum(today_closes) / len(today_closes)
             print(f"  {sym} CDM: {state.cdm[sym]:.2f} ({len(today_closes)} bars)")
 
-        # PDM
-        if bars_yesterday:
-            yd_closes = [b['c'] for b in bars_yesterday]
+        # PDM = most recent trading day BEFORE today with actual bars.
+        # Skips weekends, holidays automatically.
+        prior_days = sorted([d for d in bars_by_day.keys() if d < today], reverse=True)
+        if prior_days:
+            prev_trading_day = prior_days[0]
+            yd_closes = [b['c'] for b in bars_by_day[prev_trading_day]]
             state.pdm[sym] = sum(yd_closes) / len(yd_closes)
-            print(f"  {sym} PDM: {state.pdm[sym]:.2f} ({len(yd_closes)} bars)")
+            print(f"  {sym} PDM: {state.pdm[sym]:.2f} ({len(yd_closes)} bars on {prev_trading_day})")
+        else:
+            print(f"  {sym} PDM: — (no prior session bars found in 5-day window)")
 
         # CMM/PMM from hourly (current contract covers recent months)
         hourly = sync_requests.post(f'{base_url}/History/retrieveBars', json={
