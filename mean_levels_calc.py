@@ -103,20 +103,31 @@ def compute_mean_levels(
     df = bars.sort("timestamp")
 
     # Futures trading day rolls at 5 PM CT (17:00).
-    # Shift timestamps by +7 hours so that bars after 5 PM CT
-    # get grouped into the NEXT calendar date.
-    # Example: 5:01 PM CT on Apr 1 → shifted to 12:01 AM Apr 2 → date = Apr 2
-    #          4:59 PM CT on Apr 1 → shifted to 11:59 PM Apr 1 → date = Apr 1
+    # The CORRECT way to do this is to convert UTC timestamps to America/Chicago
+    # (which auto-handles DST), then subtract 17 hours so 5 PM CT becomes
+    # midnight in the shifted frame. Bars before 5 PM CT stay in 'yesterday',
+    # bars at/after 5 PM CT roll into 'today'.
     #
-    # NOTE: Old code used pl.col(...).str.cat(...) for year_month —
-    # that API was removed in Polars 0.20+. Now using pl.concat_str().
-    shifted = pl.col("timestamp") + pl.duration(hours=7)
+    # PRIOR BUG (observed 2026-06-04):
+    # Old code used a fixed `+ pl.duration(hours=7)` shift, which is
+    # correct for CST (UTC-6) but WRONG for CDT (UTC-5). During CDT,
+    # this caused every bar between 4pm-5pm CT yesterday to be bucketed
+    # into today's session, inflating CDM by ~3 MES pts / ~33 MNQ pts.
+    # Comparison vs ground truth on 2026-06-04:
+    #   MES CDM: engine 7552.64 vs truth 7549.66 (Δ +2.98)
+    #   MNQ CDM: engine 30436.72 vs truth 30403.83 (Δ +32.89)
+    #
+    # NOTE: Polars >= 0.20 also removed .str.cat(); using pl.concat_str() now.
+    ct_time = pl.col("timestamp").dt.convert_time_zone("America/Chicago")
+    # Subtract 17 hours so the 5 PM CT boundary lands at calendar midnight.
+    # Then take the date — bars at/after 5 PM CT belong to the NEXT trading day.
+    rolled = ct_time - pl.duration(hours=17)
     df = df.with_columns([
-        shifted.dt.date().alias("date"),
+        rolled.dt.date().alias("date"),
         pl.concat_str([
-            shifted.dt.year().cast(pl.Utf8),
+            rolled.dt.year().cast(pl.Utf8),
             pl.lit("-"),
-            shifted.dt.month().cast(pl.Utf8).str.pad_start(2, "0"),
+            rolled.dt.month().cast(pl.Utf8).str.pad_start(2, "0"),
         ]).alias("year_month"),
     ])
 
