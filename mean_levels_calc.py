@@ -118,10 +118,16 @@ def compute_mean_levels(
     #   MNQ CDM: engine 30436.72 vs truth 30403.83 (Δ +32.89)
     #
     # NOTE: Polars >= 0.20 also removed .str.cat(); using pl.concat_str() now.
+    # ADD 7 hours in CT-aware space so that 5 PM CT = midnight of the
+    # NEXT calendar date in the shifted frame:
+    #   - 4:59 PM CT today → +7h → 11:59 PM today → date = today (correct)
+    #   - 5:00 PM CT today → +7h → 12:00 AM tomorrow → date = tomorrow (correct)
+    # This both rolls the day boundary AND the month boundary in one shot.
+    #
+    # Critical case: Sunday globex open at 5:00 PM CT — those bars must
+    # belong to MONDAY (the new trading day). Under +7h shift they do.
     ct_time = pl.col("timestamp").dt.convert_time_zone("America/Chicago")
-    # Subtract 17 hours so the 5 PM CT boundary lands at calendar midnight.
-    # Then take the date — bars at/after 5 PM CT belong to the NEXT trading day.
-    rolled = ct_time - pl.duration(hours=17)
+    rolled = ct_time + pl.duration(hours=7)
     df = df.with_columns([
         rolled.dt.date().alias("date"),
         pl.concat_str([
