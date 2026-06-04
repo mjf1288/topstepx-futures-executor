@@ -107,12 +107,17 @@ def compute_mean_levels(
     # get grouped into the NEXT calendar date.
     # Example: 5:01 PM CT on Apr 1 → shifted to 12:01 AM Apr 2 → date = Apr 2
     #          4:59 PM CT on Apr 1 → shifted to 11:59 PM Apr 1 → date = Apr 1
+    #
+    # NOTE: Old code used pl.col(...).str.cat(...) for year_month —
+    # that API was removed in Polars 0.20+. Now using pl.concat_str().
+    shifted = pl.col("timestamp") + pl.duration(hours=7)
     df = df.with_columns([
-        (pl.col("timestamp") + pl.duration(hours=7)).dt.date().alias("date"),
-        (pl.col("timestamp") + pl.duration(hours=7)).dt.year().cast(pl.Utf8).str.cat(
-            (pl.col("timestamp") + pl.duration(hours=7)).dt.month().cast(pl.Utf8).str.pad_start(2, "0"),
-            separator="-"
-        ).alias("year_month"),
+        shifted.dt.date().alias("date"),
+        pl.concat_str([
+            shifted.dt.year().cast(pl.Utf8),
+            pl.lit("-"),
+            shifted.dt.month().cast(pl.Utf8).str.pad_start(2, "0"),
+        ]).alias("year_month"),
     ])
 
     current_price = float(df["close"][-1])
