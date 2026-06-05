@@ -109,9 +109,24 @@ def get_futures_month(ct_time):
 # ─────────────────────────────────────────────────────────────
 def update_running_means(symbol, close, timestamp):
     """Update CDM/CMM with a new 5-min bar close."""
+    # Defensive: if timestamp is naive (no tz info), assume UTC. Some SDK
+    # bar events have inconsistent timezone metadata.
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
     ct_time = timestamp.astimezone(CT)
     today = get_futures_day(ct_time)
     this_month = get_futures_month(ct_time)
+
+    # DIAGNOSTIC: log the day-key transition the first time a new bar
+    # comes in, so we can spot seed/realtime key mismatches.
+    day_key = (symbol, today)
+    prev_n = len(state.day_closes.get(day_key, []))
+    if prev_n == 0:
+        # Either first ever bar for this key, or seed key didn't match.
+        # Show what other keys exist for this symbol so we can diagnose.
+        existing_keys = [k for k in state.day_closes.keys() if k[0] == symbol]
+        print(f"  [{symbol}] NEW day-key {today} (close={close:.2f}, ct={ct_time.isoformat()}) "
+              f"— existing keys for this symbol: {existing_keys}")
 
     # Day roll — save yesterday's CDM as PDM
     if state.current_day and state.current_day != today:
