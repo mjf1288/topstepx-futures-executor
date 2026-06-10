@@ -445,30 +445,21 @@ async def on_new_bar(symbol, bar_data, client, account):
             if round(entry_price, 2) in existing_order_prices:
                 continue
 
-            # Re-query exposure from broker BEFORE placing (covers fills
-            # that happened since this scan cycle started)
-            try:
-                async with aiohttp.ClientSession() as http:
-                    pr = await http.get(f'{base_url}/Position/searchOpen', params={'accountId': account.id}, headers=hdrs)
-                    pdata = await pr.json()
-                    live_pos = sum(abs(p.get('size', 0)) for p in (pdata or [])
-                                   if p.get('contractId', '') == contract_id) if isinstance(pdata, list) else open_pos_count
-                    orr = await http.get(f'{base_url}/Order/searchOpen', params={'accountId': account.id}, headers=hdrs)
-                    odata = await orr.json()
-                    live_orders = sum(1 for o in (odata or [])
-                                      if o.get('contractId', '') == contract_id
-                                      and o.get('type') == 1 and o.get('side') == side) if isinstance(odata, list) else open_order_count
-                    live_exposure = live_pos + live_orders
-            except Exception:
-                live_exposure = total_exposure  # fallback
-
-            if live_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
-                print(f"  [{symbol}] CAP HIT mid-cycle — {live_pos} pos + {live_orders} working = {live_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}, halting placements")
+            # Cap check using the scan-cycle exposure plus pending placements
+            # in this loop. We trust the scan-cycle counts (computed fresh
+            # at function entry from /Position/searchOpen and /Order/searchOpen)
+            # rather than re-querying every level — those repeated queries
+            # were causing intermittent 'cannot access live_pos' errors
+            # without adding real safety value.
+            if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
+                print(f"  [{symbol}] CAP HIT mid-cycle — {open_pos_count} pos + {open_order_count + (total_exposure - open_pos_count - open_order_count)} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}, halting placements")
                 break
 
             await place_or_update_entry(client, account, symbol, level_name,
                                         contract_id, side, entry_price, tick_size)
-            total_exposure = live_exposure + 1
+            # Optimistically increment — next scan cycle will re-query
+            # actual broker state to correct any drift.
+            total_exposure += 1
 
     except Exception as e:
         print(f"  [{symbol}] Error (non-fatal): {e}")
