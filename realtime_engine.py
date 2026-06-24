@@ -181,11 +181,14 @@ def get_all_eligible_levels(symbol, mode, price, tick_size):
     The engine re-checks every 5-min bar, so as price moves, new levels
     become eligible and get orders placed automatically.
     """
+    # CMM/PMM disabled while U26 builds enough native history for accurate
+    # monthly means (re-enable mid-July 2026 once U26 has 3-4 weeks of data).
+    # User will manually place orders at monthly levels in the meantime.
     levels = {
         'CDM': state.cdm.get(symbol),
         'PDM': state.pdm.get(symbol),
-        'CMM': state.cmm.get(symbol),
-        'PMM': state.pmm.get(symbol),
+        # 'CMM': state.cmm.get(symbol),  # DISABLED — U26 native data insufficient
+        # 'PMM': state.pmm.get(symbol),  # DISABLED — U26 native data insufficient
     }
     result = []
     for name, level in levels.items():
