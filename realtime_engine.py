@@ -278,15 +278,20 @@ async def check_and_bracket_fills(client, account):
     base_url = client.base_url
     hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
-    # Get current positions from API to detect fills
+    # Get current positions from API to detect fills.
+    # POST + json body (GET returns error shape).
     try:
         async with aiohttp.ClientSession() as http:
-            resp = await http.get(f'{base_url}/Position/searchOpen',
-                                  params={'accountId': account.id}, headers=hdrs)
-            positions = await resp.json()
+            resp = await http.post(f'{base_url}/Position/searchOpen',
+                                   json={'accountId': account.id}, headers=hdrs)
+            pos_data = await resp.json()
     except Exception:
         return
-    if not isinstance(positions, list):
+    if isinstance(pos_data, dict):
+        positions = pos_data.get('positions', [])
+    elif isinstance(pos_data, list):
+        positions = pos_data
+    else:
         return
 
     # Build a map: contractId -> (side, size, avgPrice)
@@ -399,34 +404,60 @@ async def on_new_bar(symbol, bar_data, client, account):
         base_url = client.base_url
         hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
-        # Count open positions for this instrument
+        # Count open positions for this instrument.
+        # NOTE: TopstepX API requires POST with json body. Previously used
+        # GET with params= which returned an error shape — isinstance check
+        # then failed silently and open_pos_count stayed at 0. That made the
+        # cap effectively count only working orders, which vanish on fill,
+        # so the engine could accumulate positions beyond the cap.
         open_pos_count = 0
+        pos_query_ok = False
         try:
             async with aiohttp.ClientSession() as http:
-                resp = await http.get(f'{base_url}/Position/searchOpen', params={'accountId': account.id}, headers=hdrs)
+                resp = await http.post(f'{base_url}/Position/searchOpen',
+                                       json={'accountId': account.id}, headers=hdrs)
                 pos_data = await resp.json()
-                if isinstance(pos_data, list):
-                    for p in pos_data:
-                        if p.get('contractId', '') == contract_id:
-                            open_pos_count += abs(p.get('size', 0))
-        except:
-            pass
+            pos_query_ok = True
+            if isinstance(pos_data, dict):
+                positions = pos_data.get('positions', [])
+            elif isinstance(pos_data, list):
+                positions = pos_data
+            else:
+                positions = []
+            for p in positions:
+                if p.get('contractId', '') == contract_id:
+                    open_pos_count += abs(p.get('size', 0))
+        except Exception as e:
+            print(f"  [{symbol}] SKIP — position query failed: {e!r}")
 
         # Count open limit orders for this instrument (entry orders only, type=1=Limit)
         open_order_count = 0
         existing_order_prices = set()
+        ord_query_ok = False
         try:
             async with aiohttp.ClientSession() as http:
-                resp = await http.get(f'{base_url}/Order/searchOpen', params={'accountId': account.id}, headers=hdrs)
+                resp = await http.post(f'{base_url}/Order/searchOpen',
+                                       json={'accountId': account.id}, headers=hdrs)
                 ord_data = await resp.json()
-                if isinstance(ord_data, list):
-                    for o in ord_data:
-                        if o.get('contractId', '') == contract_id and o.get('type') == 1 and o.get('side') == side:
-                            open_order_count += 1
-                            if o.get('limitPrice'):
-                                existing_order_prices.add(round(o['limitPrice'], 2))
-        except:
-            pass
+            ord_query_ok = True
+            if isinstance(ord_data, dict):
+                orders = ord_data.get('orders', [])
+            elif isinstance(ord_data, list):
+                orders = ord_data
+            else:
+                orders = []
+            for o in orders:
+                if o.get('contractId', '') == contract_id and o.get('type') == 1 and o.get('side') == side:
+                    open_order_count += 1
+                    if o.get('limitPrice'):
+                        existing_order_prices.add(round(o['limitPrice'], 2))
+        except Exception as e:
+            print(f"  [{symbol}] SKIP — order query failed: {e!r}")
+
+        # Hard rule: if EITHER query failed, do not place new orders this bar.
+        # The cap is only meaningful when we can see both positions and orders.
+        if not (pos_query_ok and ord_query_ok):
+            return
 
         total_exposure = open_pos_count + open_order_count
         if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
