@@ -675,7 +675,10 @@ async def main(modes: dict, dry_run: bool = False):
             # Create one TradingSuite per active instrument
             suites = []
             for sym in active_syms:
-                suite = await TradingSuite.create(instruments=[sym], timeframes=["5min"])
+                # NOTE: 3.4.x SDK uses singular 'instrument=' (string), not
+                # 'instruments=' (list). 3.5.x+ has bounded_statistics bug that
+                # crashes on real-time bars, so we're pinned to 3.4.0.
+                suite = await TradingSuite.create(instrument=sym, timeframes=["5min"])
 
                 def make_callback(symbol):
                     async def cb(event):
