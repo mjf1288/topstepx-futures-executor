@@ -27,7 +27,11 @@ from datetime import datetime, timedelta, timezone
 from collections import defaultdict
 
 # Suppress verbose SDK logging
+# Legacy: project_x_py library no longer used, but its logger name may
+# still be referenced from cached artifacts. Silencing is harmless.
 logging.getLogger('project_x_py').setLevel(logging.WARNING)
+logging.getLogger('topstep_stream').setLevel(logging.INFO)
+logging.getLogger('signalrcore').setLevel(logging.WARNING)
 
 import pytz
 from dotenv import load_dotenv
@@ -644,7 +648,11 @@ def seed_historical(client):
 # MAIN
 # ─────────────────────────────────────────────────────────────
 async def main(modes: dict, dry_run: bool = False):
-    from project_x_py import ProjectX, TradingSuite, EventType
+    # Direct-ProjectX rebuild (project_x_py library is abandoned + broken).
+    # topstep_api handles REST (auth, historical bars, orders, positions).
+    # topstep_stream handles SignalR + tick-to-5min bar aggregation.
+    from topstep_api import from_env as topstep_from_env, TopstepAPIError  # noqa: F401
+    from topstep_stream import TopstepStream
 
     state.modes = modes  # {symbol: 'BUY'/'SELL'}
     state.dry_run = dry_run
@@ -660,120 +668,141 @@ async def main(modes: dict, dry_run: bool = False):
 ╚═══════════════════════════════════════════════════════╝
 """)
 
+    stream: TopstepStream | None = None
     try:
-        async with ProjectX.from_env() as client:
-            await client.authenticate()
-            account = client.get_account_info()
-            print(f"  Account: {account.name}")
-            print(f"  Balance: ${account.balance:,.2f}")
+        # Sync auth + account selection (no `await` needed).
+        client = topstep_from_env()
+        account = client.get_account_info()
+        print(f"  Account: {account.name}")
+        print(f"  Balance: ${account.balance:,.2f}")
 
-            # Seed historical data
-            print(f"\n  Loading historical data...")
-            seed_historical(client)
-            print(f"  Ready.\n")
+        # Seed historical data. Uses client.get_session_token() +
+        # client.base_url — provided by SDK-compat shim on TopstepAPI.
+        print(f"\n  Loading historical data...")
+        seed_historical(client)
+        print(f"  Ready.\n")
 
-            # Create one TradingSuite per active instrument
-            suites = []
-            for sym in active_syms:
-                # NOTE: 3.4.x SDK uses singular 'instrument=' (string), not
-                # 'instruments=' (list). 3.5.x+ has bounded_statistics bug that
-                # crashes on real-time bars, so we're pinned to 3.4.0.
-                suite = await TradingSuite.create(instrument=sym, timeframes=["5min"])
+        # Real-time stream. ProjectX has no native bar-close event; we
+        # aggregate ticks into 5-min bars locally via TopstepStream.
+        stream = TopstepStream(jwt_token=client.get_jwt())
+        loop = asyncio.get_event_loop()
 
-                def make_callback(symbol):
-                    async def cb(event):
-                        data = event.data
-                        if data.get('timeframe') != '5min':
-                            return
-                        bar = data.get('data', {})
-                        close = bar.get('close') if isinstance(bar, dict) else getattr(bar, 'close', None)
-                        if close:
-                            await on_new_bar(symbol, {
-                                'close': close,
-                                'high': bar.get('high', close) if isinstance(bar, dict) else getattr(bar, 'high', close),
-                                'low': bar.get('low', close) if isinstance(bar, dict) else getattr(bar, 'low', close),
-                                'open': bar.get('open', close) if isinstance(bar, dict) else getattr(bar, 'open', close),
-                                'timestamp': datetime.now(CT),
-                            }, client, account)
-                    return cb
+        # Map contract_id -> symbol so the single stream-level callback
+        # can route to the right per-symbol handler.
+        symbol_by_contract = {
+            CONTRACT_MAP[sym][0]: sym
+            for sym in active_syms
+            if sym in CONTRACT_MAP
+        }
 
-                await suite.on(EventType.NEW_BAR, make_callback(sym))
-                suites.append(suite)
+        def dispatch_bar(contract_id: str, bar: dict) -> None:
+            # Runs on signalrcore's thread. Marshal to the async loop.
+            sym = symbol_by_contract.get(contract_id)
+            if sym is None:
+                return
+            try:
+                c = float(bar['c'])
+            except (KeyError, ValueError, TypeError):
+                return
+            bar_data = {
+                'close': c,
+                'high': float(bar.get('h', c)),
+                'low': float(bar.get('l', c)),
+                'open': float(bar.get('o', c)),
+                'timestamp': datetime.now(CT),
+            }
+            asyncio.run_coroutine_threadsafe(
+                on_new_bar(sym, bar_data, client, account), loop
+            )
 
-            print(f"  STREAMING — {mode_lines}")
-            print(f"  Ctrl+C to stop\n")
+        stream.on_bar_close(dispatch_bar)
 
-            # Keep alive + monitor positions + hourly status
-            while True:
-                await asyncio.sleep(60)
+        for sym in active_syms:
+            if sym not in CONTRACT_MAP:
+                print(f"  {sym}: unknown contract, skipping subscription")
+                continue
+            cid = CONTRACT_MAP[sym][0]
+            stream.subscribe(cid)
+            print(f"  Subscribed: {sym} → {cid}")
 
-                # Check if any active positions were closed (stop/target hit)
-                try:
-                    import aiohttp
-                    token = client.get_session_token()
-                    base_url = client.base_url
-                    api_h = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-                    async with aiohttp.ClientSession() as http:
-                        async with http.post(f'{base_url}/Position/searchOpen',
-                                             json={'accountId': account.id}, headers=api_h) as resp:
-                            open_positions = await resp.json()
-                            # Count open contracts per symbol
-                            open_count = defaultdict(int)
-                            for p in open_positions.get('positions', []):
-                                cid = p.get('contractId', '')
-                                parts = cid.split('.')
-                                if len(parts) >= 4:
-                                    open_count[parts[3]] += p.get('size', 1)
+        print(f"\n  Connecting to ProjectX market hub...")
+        stream.start()
+        print(f"  Streaming.\n")
 
-                    # Check each active position key
-                    for key in list(state.active_positions.keys()):
-                        sym, level = key
-                        # If symbol has fewer open positions than tracked, something closed
-                        tracked = sum(1 for k in state.active_positions if k[0] == sym)
-                        if open_count.get(sym, 0) < tracked:
-                            pos = state.active_positions[key]
-                            side = pos.get('side', 1)
-                            entry = pos.get('entry', 0)
-                            current = state.current_price.get(sym, 0)
-                            pnl = (current - entry) if side == 0 else (entry - current)
+        print(f"  STREAMING — {mode_lines}")
+        print(f"  Ctrl+C to stop\n")
 
-                            if pnl <= 0:
-                                state.session_losses[sym] += 1
-                                result = "LOSS"
-                            else:
-                                state.session_losses[sym] = 0
-                                result = "WIN"
+        # Keep alive + monitor positions + hourly status
+        while True:
+            await asyncio.sleep(60)
 
-                            losses = state.session_losses[sym]
-                            stopped = " — STOPPED for session" if losses >= 3 else ""
-                            print(f"  [{sym}] {level} CLOSED ({result}) | "
-                                  f"Consecutive losses: {losses}{stopped}")
-                            del state.active_positions[key]
-                            break  # Re-check next cycle
-                except:
-                    pass
-                try:
-                    et_now = datetime.now(ET)
-                    if et_now.minute == 0:
-                        print(f"\n  [{et_now.strftime('%H:%M')}] Status")
-                        for sym in active_syms:
-                            price = state.current_price.get(sym)
-                            price_s = f"{price:.2f}" if price else "?"
-                            cdm_s = f"{state.cdm.get(sym):.2f}" if state.cdm.get(sym) else "-"
-                            pdm_s = f"{state.pdm.get(sym):.2f}" if state.pdm.get(sym) else "-"
-                            cmm_s = f"{state.cmm.get(sym):.2f}" if state.cmm.get(sym) else "-"
-                            pmm_s = f"{state.pmm.get(sym):.2f}" if state.pmm.get(sym) else "-"
-                            pending = [k[1] for k in state.pending_entries if k[0] == sym]
-                            active = [k[1] for k in state.active_positions if k[0] == sym]
-                            losses = state.session_losses.get(sym, 0)
-                            loss_s = f" ({losses}L)" if losses else ""
-                            sym_mode = state.modes.get(sym, '?')
-                            print(f"    {sym} [{sym_mode}]: {price_s} | CDM:{cdm_s} PDM:{pdm_s} CMM:{cmm_s} PMM:{pmm_s}")
-                            if pending: print(f"      Pending: {', '.join(pending)}")
-                            if active: print(f"      Active: {', '.join(active)}")
-                            if losses >= 3: print(f"      STOPPED for session")
-                except:
-                    pass
+            # Check if any active positions were closed (stop/target hit)
+            try:
+                import aiohttp
+                token = client.get_session_token()
+                base_url = client.base_url
+                api_h = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+                async with aiohttp.ClientSession() as http:
+                    async with http.post(f'{base_url}/Position/searchOpen',
+                                         json={'accountId': account.id}, headers=api_h) as resp:
+                        open_positions = await resp.json()
+                        # Count open contracts per symbol
+                        open_count = defaultdict(int)
+                        for p in open_positions.get('positions', []):
+                            cid = p.get('contractId', '')
+                            parts = cid.split('.')
+                            if len(parts) >= 4:
+                                open_count[parts[3]] += p.get('size', 1)
+
+                # Check each active position key
+                for key in list(state.active_positions.keys()):
+                    sym, level = key
+                    # If symbol has fewer open positions than tracked, something closed
+                    tracked = sum(1 for k in state.active_positions if k[0] == sym)
+                    if open_count.get(sym, 0) < tracked:
+                        pos = state.active_positions[key]
+                        side = pos.get('side', 1)
+                        entry = pos.get('entry', 0)
+                        current = state.current_price.get(sym, 0)
+                        pnl = (current - entry) if side == 0 else (entry - current)
+
+                        if pnl <= 0:
+                            state.session_losses[sym] += 1
+                            result = "LOSS"
+                        else:
+                            state.session_losses[sym] = 0
+                            result = "WIN"
+
+                        losses = state.session_losses[sym]
+                        stopped = " — STOPPED for session" if losses >= 3 else ""
+                        print(f"  [{sym}] {level} CLOSED ({result}) | "
+                              f"Consecutive losses: {losses}{stopped}")
+                        del state.active_positions[key]
+                        break  # Re-check next cycle
+            except:
+                pass
+            try:
+                et_now = datetime.now(ET)
+                if et_now.minute == 0:
+                    print(f"\n  [{et_now.strftime('%H:%M')}] Status")
+                    for sym in active_syms:
+                        price = state.current_price.get(sym)
+                        price_s = f"{price:.2f}" if price else "?"
+                        cdm_s = f"{state.cdm.get(sym):.2f}" if state.cdm.get(sym) else "-"
+                        pdm_s = f"{state.pdm.get(sym):.2f}" if state.pdm.get(sym) else "-"
+                        cmm_s = f"{state.cmm.get(sym):.2f}" if state.cmm.get(sym) else "-"
+                        pmm_s = f"{state.pmm.get(sym):.2f}" if state.pmm.get(sym) else "-"
+                        pending = [k[1] for k in state.pending_entries if k[0] == sym]
+                        active = [k[1] for k in state.active_positions if k[0] == sym]
+                        losses = state.session_losses.get(sym, 0)
+                        loss_s = f" ({losses}L)" if losses else ""
+                        sym_mode = state.modes.get(sym, '?')
+                        print(f"    {sym} [{sym_mode}]: {price_s} | CDM:{cdm_s} PDM:{pdm_s} CMM:{cmm_s} PMM:{pmm_s}")
+                        if pending: print(f"      Pending: {', '.join(pending)}")
+                        if active: print(f"      Active: {', '.join(active)}")
+                        if losses >= 3: print(f"      STOPPED for session")
+            except:
+                pass
 
     except KeyboardInterrupt:
         print(f"\n  Stopped.")
@@ -781,6 +810,13 @@ async def main(modes: dict, dry_run: bool = False):
         print(f"\n  Fatal: {e}")
         import traceback
         traceback.print_exc()
+    finally:
+        # Clean shutdown of the WebSocket stream. Safe if never started.
+        if stream is not None:
+            try:
+                stream.stop()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

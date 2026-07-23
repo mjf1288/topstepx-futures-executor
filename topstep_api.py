@@ -52,6 +52,20 @@ class TopstepAPIError(RuntimeError):
     """Raised on any non-recoverable API failure."""
 
 
+class AccountInfo:
+    """Lightweight account-info holder that mirrors the SDK's Account shape
+    so existing engine code that reads account.id / account.name / account.balance
+    keeps working unchanged."""
+
+    def __init__(self, raw: dict):
+        self.raw = raw
+        self.id: int = raw["id"]
+        self.name: str = raw.get("name", "")
+        self.balance: float = float(raw.get("balance", 0.0))
+        self.can_trade: bool = bool(raw.get("canTrade", True))
+        self.simulated: bool = bool(raw.get("simulated", False))
+
+
 class TopstepAPI:
     """Direct REST client for the ProjectX Gateway API.
 
@@ -78,6 +92,7 @@ class TopstepAPI:
         self._token: str | None = None
         self._token_expires_at: float | None = None  # unix seconds
         self.account_id: int | None = None
+        self._account_info: AccountInfo | None = None
 
     # ─────────────────────────────────────────────────────────────
     # Internals
@@ -201,10 +216,26 @@ class TopstepAPI:
         return self._token
 
     # ─────────────────────────────────────────────────────────────
+    # SDK compatibility shim — lets existing engine code that calls
+    # client.get_session_token() and client.base_url keep working
+    # with no changes to place_or_update_entry(), check_and_bracket_fills(),
+    # seed_historical(), or the position-monitoring loop.
+    # ─────────────────────────────────────────────────────────────
+    def get_session_token(self) -> str:
+        """SDK-compat: same as get_jwt(). Engine code calls this."""
+        return self.get_jwt()
+
+    @property
+    def base_url(self) -> str:
+        """SDK-compat: base URL for direct-HTTP calls in the engine."""
+        return BASE_URL
+
+    # ─────────────────────────────────────────────────────────────
     # Account selection
     # ─────────────────────────────────────────────────────────────
-    def select_account(self) -> int:
-        """Look up account_id by account_name. Populates self.account_id.
+    def select_account(self) -> AccountInfo:
+        """Look up account by name. Populates self.account_id and
+        self._account_info. Returns the AccountInfo object.
 
         POST /Account/search
         Body:  {"onlyActiveAccounts": true}
@@ -218,13 +249,20 @@ class TopstepAPI:
         for acct in accounts:
             if acct.get("name") == self.account_name:
                 self.account_id = acct["id"]
-                return self.account_id
+                self._account_info = AccountInfo(acct)
+                return self._account_info
 
         # Not found — list what IS available
         avail = [a.get("name") for a in accounts]
         raise TopstepAPIError(
             f"Account '{self.account_name}' not found. Available: {avail}"
         )
+
+    def get_account_info(self) -> AccountInfo:
+        """SDK-compat. Returns the AccountInfo populated by select_account()."""
+        if not hasattr(self, "_account_info") or self._account_info is None:
+            raise TopstepAPIError("Call select_account() first")
+        return self._account_info
 
     # ─────────────────────────────────────────────────────────────
     # Contracts
