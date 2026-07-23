@@ -51,7 +51,7 @@ CONTRACT_MAP = {
     'MGC': ('CON.F.US.MGC.Q26', 'CON.F.US.MGC.V26', 0.10, 1.00),
 }
 
-MAX_CONTRACTS_PER_INSTRUMENT = 2  # Hard max contracts per instrument (positions + working entries)
+MAX_CONTRACTS_PER_INSTRUMENT = 4  # Hard max contracts per instrument (positions + working entries)
 CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 
 ATR_MULTIPLIER = 0.382             # ~38.2% of daily ATR (fib-based tight stop)
