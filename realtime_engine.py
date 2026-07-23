@@ -393,12 +393,15 @@ async def on_new_bar(symbol, bar_data, client, account):
         if state.session_losses[symbol] >= 3:
             return
 
-        # Get contract ID
-        try:
-            instrument = await client.get_instrument(symbol)
-            contract_id = instrument.id
-        except:
+        # Get contract ID from our own CONTRACT_MAP — no SDK call needed.
+        # (The old code awaited client.get_instrument() which was a
+        # project_x_py SDK method that TopstepAPI doesn't have. Falling
+        # through to a bare `except: return` was silently no-oping every
+        # bar close, which is why no sell orders were ever placed.)
+        if symbol not in CONTRACT_MAP:
+            print(f"  [{symbol}] SKIP — not in CONTRACT_MAP")
             return
+        contract_id = CONTRACT_MAP[symbol][0]
 
         side = 0 if mode == 'BUY' else 1
 
