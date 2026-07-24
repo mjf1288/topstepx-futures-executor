@@ -13,7 +13,9 @@ The mode (BUY or SELL) is set by you. The engine handles execution:
   - Streams 5-min bars via WebSocket
   - Recomputes CDM after every bar close
   - Places/adjusts limit entry at the closest mean level
-  - Places bracket (stop + target) immediately on fill
+  - EXECUTION-ONLY: places ENTRY LIMITs only. User attaches stops/targets
+    manually on the TopstepX UI. (Bracket placement removed 2026-07-23
+    after orphan-bracket accumulation caused ~40 stale orders.)
   - 1 lot per symbol, max 3 positions (MNQ, MES, MYM)
 """
 
@@ -230,28 +232,27 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
         print(f"  [{symbol}] {level_name} moved: {existing['entry_price']} -> {entry_price}")
 
     side_str = 'BUY' if side == 0 else 'SELL'
-    atr = state.atr.get(symbol)
-    if not atr:
-        return
-    stop_dist = atr * ATR_MULTIPLIER
 
-    if side == 0:  # BUY
-        stop = round(round((entry_price - stop_dist) / tick_size) * tick_size, 6)
-        target = round(round((entry_price + stop_dist * RR_RATIO) / tick_size) * tick_size, 6)
-    else:  # SELL
-        stop = round(round((entry_price + stop_dist) / tick_size) * tick_size, 6)
-        target = round(round((entry_price - stop_dist * RR_RATIO) / tick_size) * tick_size, 6)
+    # ATR is still computed and logged so you have a REFERENCE stop distance
+    # to use when manually attaching a stop on TopstepX UI — the engine
+    # does NOT place stops itself in execution-only mode.
+    atr = state.atr.get(symbol)
+    ref_stop_dist = (atr * ATR_MULTIPLIER) if atr else None
+    ref_stop_str = f"ref stop ±{ref_stop_dist:.2f}pts" if ref_stop_dist else "ATR pending"
 
     if state.dry_run:
-        print(f"  [{symbol}] DRY: {side_str} {level_name} @ {entry_price} | stop {stop} | target {target}")
-        state.pending_entries[key] = {'order_id': 'DRY', 'entry_price': entry_price,
-            'side': side, 'contract_id': contract_id, 'stop': stop, 'target': target,
-            'level': level_name, 'bracketed': False}
+        print(f"  [{symbol}] DRY: {side_str} {level_name} @ {entry_price} ({ref_stop_str})")
+        state.pending_entries[key] = {
+            'order_id': 'DRY', 'entry_price': entry_price,
+            'side': side, 'contract_id': contract_id, 'level': level_name,
+        }
         return
 
-    # ── ENTRY ONLY. Brackets (stop + target) are placed by check_and_bracket()
-    # AFTER the entry fills. This prevents the broker from treating the target
-    # LIMIT as a standalone short (or long) that triggers on the way to entry.
+    # ══ EXECUTION-ONLY MODE ═════════════════════════════════════════════════
+    # Engine places the ENTRY LIMIT only. Once filled, YOU are responsible
+    # for attaching stop + target on the TopstepX UI. The engine never
+    # places brackets. Cap enforcement continues to prevent overexposure.
+    # ═══════════════════════════════════════════════════════════════════
     async with aiohttp.ClientSession() as http:
         r = await (await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
@@ -263,91 +264,28 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
         entry_id = r['orderId']
 
     state.pending_entries[key] = {
-        'order_id': entry_id, 'stop_id': None, 'target_id': None,
-        'entry_price': entry_price, 'stop': stop, 'target': target,
+        'order_id': entry_id,
+        'entry_price': entry_price,
         'side': side, 'contract_id': contract_id, 'level': level_name,
-        'bracketed': False,  # True once stop+target are placed post-fill
     }
-    print(f"  [{symbol}] {side_str} {level_name} @ {entry_price} (stop {stop} / target {target} — bracket on fill)")
+    print(f"  [{symbol}] {side_str} {level_name} @ {entry_price} ({ref_stop_str}) — attach stop manually on TopstepX")
 
 
 # ─────────────────────────────────────────────────────────────
 async def check_and_bracket_fills(client, account):
-    """Poll for filled entries that don't yet have brackets attached.
-    Places stop + target immediately upon fill detection."""
-    import aiohttp
-    if state.dry_run:
-        return
-    token = client.get_session_token()
-    base_url = client.base_url
-    hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+    """EXECUTION-ONLY MODE (2026-07-23): no-op.
 
-    # Get current positions from API to detect fills.
-    # POST + json body (GET returns error shape).
-    try:
-        async with aiohttp.ClientSession() as http:
-            resp = await http.post(f'{base_url}/Position/searchOpen',
-                                   json={'accountId': account.id}, headers=hdrs)
-            pos_data = await resp.json()
-    except Exception:
-        return
-    if isinstance(pos_data, dict):
-        positions = pos_data.get('positions', [])
-    elif isinstance(pos_data, list):
-        positions = pos_data
-    else:
-        return
+    The engine no longer places stops or targets on fill. YOU attach
+    risk management manually on the TopstepX UI. This function used to
+    poll positions and place bracket orders; those calls are removed
+    because leftover orphan brackets accumulated across restarts and
+    caused ~40 stale orders + wrong-side exposure on 2026-07-23.
 
-    # Build a map: contractId -> (side, size, avgPrice)
-    pos_map = {}
-    for p in positions:
-        cid = p.get('contractId', '')
-        pos_map.setdefault(cid, []).append({
-            'type': p.get('type'),  # 1=LONG, 2=SHORT
-            'size': abs(p.get('size', 0)),
-            'avg_price': p.get('averagePrice', 0),
-        })
-
-    # For each pending entry without brackets, check if it filled
-    for key, pend in list(state.pending_entries.items()):
-        if pend.get('bracketed'):
-            continue
-        sym, level_name = key
-        cid = pend['contract_id']
-        side = pend['side']
-        expected_pos_type = 1 if side == 0 else 2  # 1=LONG for BUY, 2=SHORT for SELL
-
-        # Look for a matching open position — fill detected if one exists
-        fills = pos_map.get(cid, [])
-        matching = [f for f in fills if f['type'] == expected_pos_type]
-        if not matching:
-            continue
-
-        # Fill detected → place bracket NOW
-        stop_side = 1 if side == 0 else 0
-        stop = pend['stop']
-        target = pend['target']
-
-        try:
-            async with aiohttp.ClientSession() as http:
-                r_stop = await (await http.post(f'{base_url}/Order/place', json={
-                    'accountId': account.id, 'contractId': cid,
-                    'type': 4, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'stopPrice': stop,
-                }, headers=hdrs)).json()
-                stop_id = r_stop.get('orderId')
-
-                r_tp = await (await http.post(f'{base_url}/Order/place', json={
-                    'accountId': account.id, 'contractId': cid,
-                    'type': 1, 'side': stop_side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': target,
-                }, headers=hdrs)).json()
-                target_id = r_tp.get('orderId')
-
-            pend['stop_id'] = stop_id
-            pend['target_id'] = target_id
-            pend['bracketed'] = True
-            print(f"  [{sym}] {level_name} FILLED → bracket placed (stop {stop} / target {target})")
-        except Exception as e:
-            print(f"  [{sym}] {level_name} bracket placement failed: {e}")
+    Kept as an async no-op so the call-site in on_new_bar() doesn't
+    need to change and can be safely re-enabled later if we build a
+    proper OCO/orphan-cleanup implementation.
+    """
+    return
 
 
 # ─────────────────────────────────────────────────────────────
@@ -667,7 +605,7 @@ async def main(modes: dict, dry_run: bool = False):
 ╔═══════════════════════════════════════════════════════╗
 ║  Tzu Strategic Momentum  ({live_str})                  
 ║  {mode_lines:<52}║
-║  Stops: {ATR_MULTIPLIER}x ATR | R:R 1:{RR_RATIO} | 1 order per level         ║
+║  EXECUTION-ONLY: attach stops/targets manually on TopstepX UI    ║
 ╚═══════════════════════════════════════════════════════╝
 """)
 
