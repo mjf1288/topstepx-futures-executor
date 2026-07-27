@@ -1,0 +1,18 @@
+# TopstepX Futures Executor — dependencies
+#
+# NOTE (2026-07-22): project-x-py was removed. It's an abandoned third-party
+# wrapper that crashed on every 5-min bar after July 2026. The engine now
+# talks directly to the ProjectX Gateway REST API (via `requests`) and
+# subscribes to the real-time market hub over SignalR (via `signalrcore`).
+
+# ── Core ─────────────────────────────────────────────────────────────
+requests>=2.31.0          # REST calls to api.topstepx.com
+signalrcore>=0.9.5        # SignalR WebSocket for rtc.topstepx.com
+python-dotenv>=1.0.0      # loads .env at startup
+pytz>=2024.1              # CT / ET timezone handling
+aiohttp>=3.9.0            # engine's async HTTP for order/position queries
+
+# ── Optional (nice-to-have) ─────────────────────────────────────────
+# polars                  # Not required. Was pulled in transitively by
+#                         # project-x-py; the new stack doesn't need it.
+# numpy, scipy            # Not required for current engine logic.
