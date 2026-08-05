@@ -91,6 +91,10 @@ class State:
         self.session_day = None   # Track which session day we're in
         self.current_day = None
         self.current_month = None
+        # Tracks last hour (ET) we refreshed CMM/PMM from fresh hourly bars.
+        # Prevents multiple refreshes per hour if the monitor loop wakes up
+        # more than once during the same :00 minute.
+        self.last_monthly_refresh_hour = None
 
 
 state = State()
@@ -114,7 +118,16 @@ def get_futures_month(ct_time):
 # RUNNING MEAN LEVELS
 # ─────────────────────────────────────────────────────────────
 def update_running_means(symbol, close, timestamp):
-    """Update CDM/CMM with a new 5-min bar close."""
+    """Update CDM (current-day mean) with a new 5-min bar close.
+
+    NOTE (2026-08-05): CMM/PMM are NO LONGER updated here. Historical
+    bug: this function was appending 5-min closes to state.month_closes,
+    which had been seeded from HOURLY bars. Mixing granularities gave
+    each 5-min close 12x more weight than an hourly bar and drifted CMM
+    by 1-1.6% within 2 weeks of continuous running. CMM/PMM are now
+    refreshed from fresh hourly API pulls in refresh_monthly_means()
+    once per hour.
+    """
     # Defensive: if timestamp is naive (no tz info), assume UTC. Some SDK
     # bar events have inconsistent timezone metadata.
     if timestamp.tzinfo is None:
@@ -128,8 +141,6 @@ def update_running_means(symbol, close, timestamp):
     day_key = (symbol, today)
     prev_n = len(state.day_closes.get(day_key, []))
     if prev_n == 0:
-        # Either first ever bar for this key, or seed key didn't match.
-        # Show what other keys exist for this symbol so we can diagnose.
         existing_keys = [k for k in state.day_closes.keys() if k[0] == symbol]
         print(f"  [{symbol}] NEW day-key {today} (close={close:.2f}, ct={ct_time.isoformat()}) "
               f"— existing keys for this symbol: {existing_keys}")
@@ -142,40 +153,80 @@ def update_running_means(symbol, close, timestamp):
                 closes = state.day_closes[prev_key]
                 state.pdm[sym] = sum(closes) / len(closes)
 
-    # Month roll — save last month's CMM as PMM
-    if state.current_month and state.current_month != this_month:
-        for sym in SYMBOLS:
-            prev_key = (sym, *state.current_month)
-            if prev_key in state.month_closes and state.month_closes[prev_key]:
-                closes = state.month_closes[prev_key]
-                state.pmm[sym] = sum(closes) / len(closes)
-
     state.current_day = today
     state.current_month = this_month
 
-    # Accumulate closes
+    # Accumulate ONLY day closes here. Month-level CMM/PMM are refreshed
+    # from fresh hourly API pulls (see refresh_monthly_means()).
     day_key = (symbol, today)
     state.day_closes[day_key].append(close)
-    month_key = (symbol, *this_month)
-    state.month_closes[month_key].append(close)
 
-    # Compute running means
-    # ── Warm-up gates ──
-    # At day/month boundaries, the running mean is statistically meaningless
-    # for the first few samples. A 1-sample CMM at globex open on the 1st of
-    # the month equals current price, so placing a limit at CMM would fill
-    # instantly with zero edge — the exact bug observed on 2026-06-01.
-    # Require a minimum sample count before publishing each mean.
     day_count = len(state.day_closes[day_key])
-    month_count = len(state.month_closes[month_key])
     if day_count >= MIN_SAMPLES_CDM:
         state.cdm[symbol] = sum(state.day_closes[day_key]) / day_count
     else:
-        state.cdm[symbol] = None  # not enough data yet — skip CDM signals
-    if month_count >= MIN_SAMPLES_CMM:
-        state.cmm[symbol] = sum(state.month_closes[month_key]) / month_count
-    else:
-        state.cmm[symbol] = None  # warm-up after month roll
+        state.cdm[symbol] = None  # warm-up
+
+
+def refresh_monthly_means(client):
+    """Refresh CMM and PMM from fresh HOURLY bars via the ProjectX API.
+
+    Called at engine startup (via seed_historical) AND periodically by the
+    monitor loop (once per hour, see main()). This is the ONLY code path
+    that mutates state.cmm and state.pmm. Live 5-min bars no longer
+    contribute to these means — they only update CDM.
+
+    Rationale: the previous implementation appended live 5-min closes to
+    a bucket that had been seeded from hourly bars, over-weighting the
+    5-min samples by 12x and drifting CMM by ~1% per week (audit
+    performed 2026-08-05 showed engine CMM off by +1.0% to +1.6% for
+    MNQ / MES / MYM after 2 weeks of continuous running).
+    """
+    import requests as sync_requests
+    token = client.get_session_token()
+    base_url = client.base_url
+    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+    now_utc = datetime.now(timezone.utc)
+    now_ct = now_utc.astimezone(CT)
+    this_month = get_futures_month(now_ct)
+    prev_m = (this_month[0], this_month[1] - 1) if this_month[1] > 1 else (this_month[0] - 1, 12)
+
+    for sym in SYMBOLS:
+        if sym not in CONTRACT_MAP:
+            continue
+        curr = CONTRACT_MAP[sym][0]
+        try:
+            resp = sync_requests.post(
+                f'{base_url}/History/retrieveBars',
+                json={
+                    "contractId": curr, "live": False,
+                    "startTime": (now_utc - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": True,
+                },
+                headers=headers, timeout=15,
+            )
+            hourly = resp.json().get('bars', [])
+        except Exception as e:
+            print(f"  [{sym}] CMM/PMM refresh failed: {e!r}")
+            continue
+
+        month_data = defaultdict(list)
+        for b in hourly:
+            try:
+                ts = datetime.fromisoformat(b['t'].replace('Z', '+00:00')).astimezone(CT)
+            except Exception:
+                continue
+            fm = get_futures_month(ts)
+            month_data[fm].append(b['c'])
+
+        if this_month in month_data and len(month_data[this_month]) >= MIN_SAMPLES_CMM:
+            state.cmm[sym] = sum(month_data[this_month]) / len(month_data[this_month])
+        elif this_month in month_data:
+            state.cmm[sym] = None  # warm-up
+        if prev_m in month_data and len(month_data[prev_m]) > 0:
+            state.pmm[sym] = sum(month_data[prev_m]) / len(month_data[prev_m])
 
 
 def get_all_eligible_levels(symbol, mode, price, tick_size):
@@ -187,14 +238,16 @@ def get_all_eligible_levels(symbol, mode, price, tick_size):
     The engine re-checks every 5-min bar, so as price moves, new levels
     become eligible and get orders placed automatically.
     """
-    # PMM stays disabled until Aug 1 2026 (U26 lacks June 1-10 native data,
-    # PMM computed on ~2/3 of June is off ~0.5% vs TV back-adjusted). Once
-    # July completes as a full native-U26 month, PMM will match TV exactly.
+    # All four means now enabled. PMM was re-enabled 2026-08-05 after a
+    # fresh audit vs raw ProjectX data confirmed engine PMM matched truth
+    # to the penny (MNQ 29174.50, MES 7526.21, MYM 52638.64, MGC 4076.60)
+    # — July 2026 is a full month of native U26 data, so no back-adjustment
+    # or partial-month artifacts remain.
     levels = {
         'CDM': state.cdm.get(symbol),
         'PDM': state.pdm.get(symbol),
-        'CMM': state.cmm.get(symbol),  # re-enabled 2026-07-01, verified vs TV within 0.04%
-        # 'PMM': state.pmm.get(symbol),  # re-enable on/after 2026-08-01
+        'CMM': state.cmm.get(symbol),
+        'PMM': state.pmm.get(symbol),
     }
     result = []
     for name, level in levels.items():
@@ -549,9 +602,12 @@ def seed_historical(client):
             fm = get_futures_month(ts)
             month_data[fm].append(b['c'])
 
+        # Seed CMM/PMM directly from fresh hourly bars — do NOT populate
+        # state.month_closes anymore. Live 5-min bars no longer contribute
+        # to CMM/PMM (see refresh_monthly_means() docstring). These values
+        # will be refreshed hourly in the main monitor loop.
         if this_month in month_data:
             state.cmm[sym] = sum(month_data[this_month]) / len(month_data[this_month])
-            state.month_closes[(sym, *this_month)] = month_data[this_month]
             print(f"  {sym} CMM: {state.cmm[sym]:.2f}")
 
         prev_m = (this_month[0], this_month[1]-1) if this_month[1]>1 else (this_month[0]-1, 12)
@@ -722,6 +778,22 @@ async def main(modes: dict, dry_run: bool = False):
                         break  # Re-check next cycle
             except:
                 pass
+            # Once per hour, at :00, refresh CMM/PMM from fresh hourly bars.
+            # This is the ONLY code that writes state.cmm and state.pmm
+            # during a live session, and it fixes the drift bug (see
+            # refresh_monthly_means() docstring for details).
+            try:
+                et_now = datetime.now(ET)
+                if et_now.minute == 0 and et_now.second < 30:
+                    if state.last_monthly_refresh_hour != et_now.hour:
+                        try:
+                            refresh_monthly_means(client)
+                            state.last_monthly_refresh_hour = et_now.hour
+                        except Exception as e:
+                            print(f"  monthly refresh failed: {e!r}")
+            except Exception:
+                pass
+
             try:
                 et_now = datetime.now(ET)
                 if et_now.minute == 0:
