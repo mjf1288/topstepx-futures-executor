@@ -50,7 +50,7 @@ CONTRACT_MAP = {
     'MNQ': ('CON.F.US.MNQ.U26', 'CON.F.US.MNQ.Z26', 0.25, 0.50),
     'MES': ('CON.F.US.MES.U26', 'CON.F.US.MES.Z26', 0.25, 1.25),
     'MYM': ('CON.F.US.MYM.U26', 'CON.F.US.MYM.Z26', 1.0, 0.50),
-    'MGC': ('CON.F.US.MGC.Q26', 'CON.F.US.MGC.V26', 0.10, 1.00),
+    'MGC': ('CON.F.US.MGC.V26', 'CON.F.US.MGC.Z26', 0.10, 1.00),
 }
 
 MAX_CONTRACTS_PER_INSTRUMENT = 4  # Hard max contracts per instrument (positions + working entries)

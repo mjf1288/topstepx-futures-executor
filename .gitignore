@@ -6,3 +6,7 @@ combine_tracker.json
 futures_scan_results.json
 session_log_*.txt
 *.log
+
+.DS_Store
+.env.bak
+*.bak

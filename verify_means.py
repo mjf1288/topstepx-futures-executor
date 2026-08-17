@@ -36,7 +36,7 @@ CONTRACT_MAP = {
     "MNQ": "CON.F.US.MNQ.U26",
     "MES": "CON.F.US.MES.U26",
     "MYM": "CON.F.US.MYM.U26",
-    "MGC": "CON.F.US.MGC.Q26",
+    "MGC": "CON.F.US.MGC.V26",
 }
 
 
