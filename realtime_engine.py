@@ -352,18 +352,37 @@ async def on_new_bar(symbol, bar_data, client, account):
     """Process a new 5-min bar. Place/update orders at ALL eligible levels."""
     try:
         close = bar_data['close']
-        tick_size = CONTRACT_MAP[symbol][2]
-
         state.current_price[symbol] = close
         update_running_means(symbol, close, bar_data['timestamp'])
-
-        # Check for fills on pending entries and attach brackets
         await check_and_bracket_fills(client, account)
 
         cdm = state.cdm.get(symbol)
         cdm_str = f"{cdm:.2f}" if cdm else "?"
         print(f"  [{symbol}] {close:.2f} | CDM: {cdm_str}")
 
+        # Delegate to shared placement logic (also called by the 60s reprice tick).
+        await _scan_and_place(symbol, close, client, account, source="5m_bar")
+
+    except Exception as e:
+        print(f"  [{symbol}] Error (non-fatal): {e}")
+
+
+async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
+    """Scan eligible levels and place/update entry limit orders.
+
+    Called from:
+      - on_new_bar()   every 5 min (source='5m_bar')  — after new CDM is computed
+      - main() loop    every 60 s  (source='1m_tick') — keeps orders synced when
+                                                        the 5-min bar hasn't closed yet
+
+    The 60s reprice does NOT recompute CDM/PDM/CMM/PMM; it uses the existing
+    state values. The point is to (a) recover any orders the broker canceled
+    or dropped, and (b) reprice a level if CMM/PMM refresh moved it > 2 ticks
+    since the last placement.
+    """
+    try:
+        tick_size = CONTRACT_MAP[symbol][2]
+        cdm = state.cdm.get(symbol)
         if not cdm:
             return
 
@@ -498,7 +517,7 @@ async def on_new_bar(symbol, bar_data, client, account):
             total_exposure += 1
 
     except Exception as e:
-        print(f"  [{symbol}] Error (non-fatal): {e}")
+        print(f"  [{symbol}] scan error ({source}) (non-fatal): {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -738,9 +757,27 @@ async def main(modes: dict, dry_run: bool = False):
         print(f"  STREAMING — {mode_lines}")
         print(f"  Ctrl+C to stop\n")
 
-        # Keep alive + monitor positions + hourly status
+        # Keep alive + monitor positions + hourly status + REPRICE
+        # every 60s so orders stay synced with current mean levels instead
+        # of only updating at 5-min bar close.
         while True:
             await asyncio.sleep(60)
+
+            # ── 60s REPRICE ─────────────────────────────────────────────
+            # For each active symbol, re-run placement logic using the
+            # current state.cdm/pdm/cmm/pmm and current price. place_or_update_entry
+            # already handles: (a) dedup by price (skip if unchanged),
+            # (b) cancel + replace if moved > 2 ticks, (c) re-place if broker
+            # canceled it. So this call is cheap when nothing changed and
+            # self-heals when something did.
+            for sym in list(state.modes.keys()):
+                px = state.current_price.get(sym)
+                if px is None:
+                    continue
+                try:
+                    await _scan_and_place(sym, px, client, account, source="1m_tick")
+                except Exception as e:
+                    print(f"  [{sym}] 60s reprice error: {e!r}")
 
             # Check if any active positions were closed (stop/target hit)
             try:
