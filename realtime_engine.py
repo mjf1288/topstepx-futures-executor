@@ -770,14 +770,21 @@ async def main(modes: dict, dry_run: bool = False):
             # (b) cancel + replace if moved > 2 ticks, (c) re-place if broker
             # canceled it. So this call is cheap when nothing changed and
             # self-heals when something did.
+            tick_ts = datetime.now(CT).strftime("%H:%M:%S CT")
+            tick_summary = []
             for sym in list(state.modes.keys()):
                 px = state.current_price.get(sym)
                 if px is None:
+                    tick_summary.append(f"{sym}=nopx")
                     continue
                 try:
                     await _scan_and_place(sym, px, client, account, source="1m_tick")
+                    cdm = state.cdm.get(sym)
+                    tick_summary.append(f"{sym}={px:.2f}/CDM={cdm:.2f}" if cdm else f"{sym}={px:.2f}/CDM=?")
                 except Exception as e:
                     print(f"  [{sym}] 60s reprice error: {e!r}")
+                    tick_summary.append(f"{sym}=err")
+            print(f"  ⏱  60s tick {tick_ts} — {' | '.join(tick_summary)}")
 
             # Check if any active positions were closed (stop/target hit)
             try:
