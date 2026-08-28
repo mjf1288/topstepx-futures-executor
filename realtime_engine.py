@@ -203,7 +203,11 @@ def refresh_monthly_means(client):
                     "contractId": curr, "live": False,
                     "startTime": (now_utc - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": True,
+                    # includePartialBar=False: partial bars have a live 'close' that
+                    # keeps changing until the bar completes. Averaging them into the
+                    # running mean corrupts CMM (each refresh injects a new pseudo-close
+                    # for the same bar-in-progress, over-weighting recent price).
+                    "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": False,
                 },
                 headers=headers, timeout=15,
             )
@@ -548,7 +552,9 @@ def seed_historical(client):
             "contractId": curr, "live": False,
             "startTime": fetch_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "unit": 2, "unitNumber": 5, "limit": 5000, "includePartialBar": True,
+            # includePartialBar=False: the seed pull must only contain completed bars.
+            # A partial bar here would corrupt state.day_closes with a moving 'close'.
+            "unit": 2, "unitNumber": 5, "limit": 5000, "includePartialBar": False,
         }, headers=headers).json().get('bars', [])
 
         # Bucket bars by FUTURES TRADING DAY (5pm CT roll). This handles
@@ -593,7 +599,8 @@ def seed_historical(client):
             "contractId": curr, "live": False,
             "startTime": (now_utc - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": True,
+            # includePartialBar=False: partial hourly bars corrupt CMM/PMM.
+            "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": False,
         }, headers=headers).json().get('bars', [])
 
         month_data = defaultdict(list)
@@ -620,6 +627,8 @@ def seed_historical(client):
             "contractId": curr, "live": False,
             "startTime": (now_utc - timedelta(days=10)).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            # Daily bars can keep partial for the current day. Partial daily bar is
+            # only used for today's H/L display, not for the running mean.
             "unit": 4, "unitNumber": 1, "limit": 500, "includePartialBar": True,
         }, headers=headers).json().get('bars', [])
         daily.sort(key=lambda x: x['t'])
