@@ -37,6 +37,7 @@ CONTRACT_MAP = {
     "MES": "CON.F.US.MES.U26",
     "MYM": "CON.F.US.MYM.U26",
     "MGC": "CON.F.US.MGC.V26",
+    "MCL": "CON.F.US.MCL.V26",   # front month rolls monthly
 }
 
 

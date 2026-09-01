@@ -44,13 +44,16 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 # ─────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────
-SYMBOLS = ["MNQ", "MES", "MYM", "MGC"]
+SYMBOLS = ["MNQ", "MES", "MYM", "MGC", "MCL"]
 
 CONTRACT_MAP = {
     'MNQ': ('CON.F.US.MNQ.U26', 'CON.F.US.MNQ.Z26', 0.25, 0.50),
     'MES': ('CON.F.US.MES.U26', 'CON.F.US.MES.Z26', 0.25, 1.25),
     'MYM': ('CON.F.US.MYM.U26', 'CON.F.US.MYM.Z26', 1.0, 0.50),
     'MGC': ('CON.F.US.MGC.V26', 'CON.F.US.MGC.Z26', 0.10, 1.00),
+    # MCL (Micro Crude Oil) rolls monthly — update these first-of-each-month.
+    # V26 = October 2026, X26 = November 2026.
+    'MCL': ('CON.F.US.MCL.V26', 'CON.F.US.MCL.X26', 0.01, 1.00),
 }
 
 MAX_CONTRACTS_PER_INSTRUMENT = 4  # Hard max contracts per instrument (positions + working entries)
@@ -901,6 +904,7 @@ if __name__ == "__main__":
     parser.add_argument("--mes", choices=["buy", "sell"], help="MES mode")
     parser.add_argument("--mym", choices=["buy", "sell"], help="MYM mode")
     parser.add_argument("--mgc", choices=["buy", "sell"], help="MGC mode")
+    parser.add_argument("--mcl", choices=["buy", "sell"], help="MCL mode")
     parser.add_argument("--dry-run", action="store_true", help="Show without executing")
     args = parser.parse_args()
 
@@ -914,6 +918,7 @@ if __name__ == "__main__":
     if args.mes: modes['MES'] = args.mes.upper()
     if args.mym: modes['MYM'] = args.mym.upper()
     if args.mgc: modes['MGC'] = args.mgc.upper()
+    if args.mcl: modes['MCL'] = args.mcl.upper()
 
     if not modes:
         parser.error("Specify --mode for all, or per-instrument flags (--mnq, --mes, --mym, --mgc)")
