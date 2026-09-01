@@ -203,6 +203,10 @@ class TopstepStream:
         self._subscribed_contracts: set[str] = set()
         self._aggregators: dict[str, BarAggregator] = {}
         self._bar_callback: Callable[[str, dict], None] | None = None
+        # Additional callbacks invoked on every raw trade (for tick-based
+        # aggregators like tick-count / range / dollar bars). Signature:
+        #   callback(contract_id: str, price: float, volume: int, ts: datetime)
+        self._tick_callbacks: list[Callable[[str, float, int, datetime], None]] = []
         self._lock = threading.RLock()
         self._sweep_thread: threading.Thread | None = None
         self._sweep_stop = threading.Event()
@@ -224,6 +228,20 @@ class TopstepStream:
         Bar dict keys: t (ISO string), o, h, l, c, v, n_ticks
         """
         self._bar_callback = callback
+
+    def on_trade_tick(
+        self,
+        callback: Callable[[str, float, int, datetime], None],
+    ) -> None:
+        """Register a callback invoked on EVERY trade tick.
+
+        Signature: callback(contract_id: str, price: float, volume: int, ts: datetime)
+
+        Multiple callbacks may be registered. Used by tick-count / range /
+        dollar-bar aggregators (e.g. anchored-VWAP on 2000-tick bars).
+        The existing 5-min bar aggregation continues to run in parallel.
+        """
+        self._tick_callbacks.append(callback)
 
     def subscribe(self, contract_id: str) -> None:
         """Subscribe to trades for a contract. Idempotent.
@@ -425,9 +443,18 @@ class TopstepStream:
                         # This can happen briefly during resubscribe. Ignore.
                         continue
                     closed_bar = agg.add_tick(float(price), int(volume), ts)
+                    tick_cbs = list(self._tick_callbacks)
 
                 if closed_bar is not None:
                     self._emit_bar_close(contract_id, closed_bar)
+
+                # Fan out raw tick to any registered tick-callbacks (e.g. VWAP
+                # aggregator). Isolated so one bad callback can't kill the loop.
+                for cb in tick_cbs:
+                    try:
+                        cb(contract_id, float(price), int(volume), ts)
+                    except Exception as e:
+                        log.warning(f"tick callback error: {e!r}")
         except Exception as e:
             # Never let a callback exception kill the connection thread
             log.exception(f"Error in _on_gateway_trade: {e!r}")
