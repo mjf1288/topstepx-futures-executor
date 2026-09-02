@@ -56,7 +56,12 @@ CONTRACT_MAP = {
     'MCL': ('CON.F.US.MCL.V26', 'CON.F.US.MCL.X26', 0.01, 1.00),
 }
 
-MAX_CONTRACTS_PER_INSTRUMENT = 4  # Hard max contracts per instrument (positions + working entries)
+# Combined cap: total contracts per instrument across BOTH the mean-level
+# engine AND the VWAP engine. Each engine independently queries the broker
+# for total exposure (positions + working orders on that contract, any side)
+# and refuses to place a new order that would push the total above this cap.
+# Set to 2 so mean + VWAP together never exceed 2 contracts per symbol.
+MAX_CONTRACTS_PER_INSTRUMENT = 2  # combined cap with VWAP engine (was 4 solo)
 CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 
 ATR_MULTIPLIER = 0.382             # ~38.2% of daily ATR (fib-based tight stop)
