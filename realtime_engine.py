@@ -488,21 +488,67 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         if not (pos_query_ok and ord_query_ok):
             return
 
-        # Every 60s tick: reprice every eligible level. place_or_update_entry
-        # handles cancel+replace of an existing order (>=2-tick move) and
-        # skips if the level hasn't moved. Cap is enforced only against
-        # broker positions (open_pos_count) so filled contracts don't get
-        # additional working orders stacked on top; working orders always
-        # follow the mean regardless of count.
+        # RECONCILE state.pending_entries from broker reality on every tick.
+        # Prior bug: engine tracked orders only in memory; on restart, the
+        # broker still had old resting orders but engine thought there were
+        # none, so it either (a) placed duplicates (rejected by contract cap)
+        # or (b) failed to reprice because the 2-tick dedup only fires when
+        # state.pending_entries has an entry.
+        #
+        # Rebuild: for each mean level, find any broker limit order for this
+        # symbol/side within 20 ticks of the level's price. Attach it as our
+        # order for that level so cancel+replace works.
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
+        for level_name, entry_price in eligible:
+            key = (symbol, level_name)
+            if key in state.pending_entries:
+                continue  # already tracked
+            # Find nearest broker order to this level within 20 ticks
+            best = None
+            best_dist = tick_size * 20  # 20-tick tolerance
+            broker_orders_snapshot = []
+            try:
+                async with aiohttp.ClientSession() as http:
+                    resp = await http.post(f'{base_url}/Order/searchOpen',
+                                           json={'accountId': account.id}, headers=hdrs)
+                    od = await resp.json()
+                broker_orders_snapshot = (od.get('orders', []) if isinstance(od, dict)
+                                          else (od if isinstance(od, list) else []))
+            except Exception:
+                broker_orders_snapshot = []
+            for bo in broker_orders_snapshot:
+                if bo.get('contractId') != contract_id: continue
+                if bo.get('type') != 1: continue
+                if bo.get('side') != side: continue
+                lp = bo.get('limitPrice')
+                if lp is None: continue
+                d = abs(float(lp) - entry_price)
+                if d <= best_dist:
+                    # Also require this broker order isn't already claimed by
+                    # a different level in state.pending_entries.
+                    already_claimed = any(
+                        pe.get('order_id') == bo.get('id')
+                        for pe in state.pending_entries.values()
+                    )
+                    if not already_claimed:
+                        best = bo
+                        best_dist = d
+            if best is not None:
+                state.pending_entries[key] = {
+                    'order_id': best.get('id'),
+                    'entry_price': float(best.get('limitPrice')),
+                    'side': side, 'contract_id': contract_id, 'level': level_name,
+                }
+                print(f"  [{symbol}] {level_name} adopted broker order {best.get('id')} @ {best.get('limitPrice')}")
+
+        # Now reprice every eligible level.
         for level_name, entry_price in eligible:
             key = (symbol, level_name)
             if key in state.active_positions:
                 continue  # Already filled at this level
-            # Never let filled positions + working orders exceed the cap.
-            # A brand-new level (no existing engine order at that level)
-            # is only allowed if we still have headroom above filled positions.
             has_existing_order = key in state.pending_entries
+            # If no existing order tracked AND we've hit position cap, skip
+            # placing a brand-new order (would be rejected anyway).
             if not has_existing_order and open_pos_count >= MAX_CONTRACTS_PER_INSTRUMENT:
                 continue
             await place_or_update_entry(client, account, symbol, level_name,
