@@ -219,7 +219,7 @@ def refresh_monthly_means(client):
                 },
                 headers=headers, timeout=15,
             )
-            hourly = resp.json().get('bars', [])
+            hourly = resp.json().get('bars') or []
         except Exception as e:
             print(f"  [{sym}] CMM/PMM refresh failed: {e!r}")
             continue
@@ -566,7 +566,7 @@ def seed_historical(client):
             # includePartialBar=False: the seed pull must only contain completed bars.
             # A partial bar here would corrupt state.day_closes with a moving 'close'.
             "unit": 2, "unitNumber": 5, "limit": 5000, "includePartialBar": False,
-        }, headers=headers).json().get('bars', [])
+        }, headers=headers).json().get('bars') or []
 
         # Bucket bars by FUTURES TRADING DAY (5pm CT roll). This handles
         # weekends and holidays automatically — days with no bars don't
@@ -612,7 +612,7 @@ def seed_historical(client):
             "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
             # includePartialBar=False: partial hourly bars corrupt CMM/PMM.
             "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": False,
-        }, headers=headers).json().get('bars', [])
+        }, headers=headers).json().get('bars') or []
 
         month_data = defaultdict(list)
         for b in hourly:
@@ -641,7 +641,7 @@ def seed_historical(client):
             # Daily bars can keep partial for the current day. Partial daily bar is
             # only used for today's H/L display, not for the running mean.
             "unit": 4, "unitNumber": 1, "limit": 500, "includePartialBar": True,
-        }, headers=headers).json().get('bars', [])
+        }, headers=headers).json().get('bars') or []
         daily.sort(key=lambda x: x['t'])
 
         if len(daily) >= 4:
