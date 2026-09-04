@@ -489,9 +489,9 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
             return
 
         total_exposure = open_pos_count + open_order_count
-        if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
-            print(f"  [{symbol}] AT CAP — {open_pos_count} pos + {open_order_count} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}, no new orders")
-            return  # Already at max — no new orders
+        at_cap = total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT
+        if at_cap:
+            print(f"  [{symbol}] AT CAP — {open_pos_count} pos + {open_order_count} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}. Repricing existing orders only, no new levels.")
 
         # Place/update at ALL eligible levels (1 order per level).
         # IMPORTANT: re-query position count BETWEEN placements within the
@@ -499,6 +499,13 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         # we add the next entry. Prior bug: optimistic local counter
         # (total_exposure += 1) diverged from broker reality and let MNQ
         # accumulate 9 contracts overnight as multiple levels cascaded.
+        #
+        # AT-CAP HANDLING (fixed 2026-09-04):
+        #   When at the position cap, we USED to early-return, which meant
+        #   working orders would sit stale at old mean levels while CDM/CMM
+        #   drifted. Now: we still walk the level list, but only allow
+        #   REPRICING an order the engine already has (state.pending_entries),
+        #   never placing a fresh one at a new level.
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
         for level_name, entry_price in eligible:
             key = (symbol, level_name)
@@ -508,21 +515,22 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
             if round(entry_price, 2) in existing_order_prices:
                 continue
 
-            # Cap check using the scan-cycle exposure plus pending placements
-            # in this loop. We trust the scan-cycle counts (computed fresh
-            # at function entry from /Position/searchOpen and /Order/searchOpen)
-            # rather than re-querying every level — those repeated queries
-            # were causing intermittent 'cannot access live_pos' errors
-            # without adding real safety value.
-            if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT:
-                print(f"  [{symbol}] CAP HIT mid-cycle — {open_pos_count} pos + {open_order_count + (total_exposure - open_pos_count - open_order_count)} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}, halting placements")
-                break
+            has_existing_order = key in state.pending_entries
+
+            # Cap check: only BLOCK when we'd be ADDING a fresh level.
+            # Repricing an existing engine-tracked order at this level is
+            # always allowed, because it's a net-zero change to exposure
+            # (cancel + replace of the same 1-contract limit).
+            if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT and not has_existing_order:
+                print(f"  [{symbol}] CAP: skipping NEW level {level_name} @ {entry_price} (would exceed cap {MAX_CONTRACTS_PER_INSTRUMENT})")
+                continue
 
             await place_or_update_entry(client, account, symbol, level_name,
                                         contract_id, side, entry_price, tick_size)
-            # Optimistically increment — next scan cycle will re-query
-            # actual broker state to correct any drift.
-            total_exposure += 1
+            # Only bump the exposure counter for a NEWLY placed order;
+            # a reprice keeps the same 1 contract in the book, no delta.
+            if not has_existing_order:
+                total_exposure += 1
 
     except Exception as e:
         print(f"  [{symbol}] scan error ({source}) (non-fatal): {e}")
