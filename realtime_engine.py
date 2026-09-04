@@ -491,46 +491,69 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         total_exposure = open_pos_count + open_order_count
         at_cap = total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT
         if at_cap:
-            print(f"  [{symbol}] AT CAP — {open_pos_count} pos + {open_order_count} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}. Repricing existing orders only, no new levels.")
+            print(f"  [{symbol}] AT CAP — {open_pos_count} pos + {open_order_count} working = {total_exposure}/{MAX_CONTRACTS_PER_INSTRUMENT}. Rotating to closest levels.")
 
-        # Place/update at ALL eligible levels (1 order per level).
-        # IMPORTANT: re-query position count BETWEEN placements within the
-        # same scan cycle so a fill that lands mid-loop is reflected before
-        # we add the next entry. Prior bug: optimistic local counter
-        # (total_exposure += 1) diverged from broker reality and let MNQ
-        # accumulate 9 contracts overnight as multiple levels cascaded.
+        # AT-CAP HANDLING (rotation, 2026-09-04):
+        #   When at cap and a NEW eligible level is closer to current price
+        #   than one of our existing working orders, we cancel the farthest
+        #   existing order and place the new one — net-zero exposure change,
+        #   orders always track the closest fib levels.
         #
-        # AT-CAP HANDLING (fixed 2026-09-04):
-        #   When at the position cap, we USED to early-return, which meant
-        #   working orders would sit stale at old mean levels while CDM/CMM
-        #   drifted. Now: we still walk the level list, but only allow
-        #   REPRICING an order the engine already has (state.pending_entries),
-        #   never placing a fresh one at a new level.
+        #   When NOT at cap, we walk the eligible list as before and add
+        #   each new level as a fresh order.
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
-        for level_name, entry_price in eligible:
+
+        # Build a list of levels we're actually going to try placing this
+        # cycle. When at cap, that means the closest N eligible levels
+        # where N == MAX_CONTRACTS_PER_INSTRUMENT minus filled positions.
+        # (Filled positions are counted as "we already have that level".)
+        capacity = MAX_CONTRACTS_PER_INSTRUMENT - open_pos_count
+        if capacity < 0:
+            capacity = 0
+        # Rank eligible levels by distance from current price (closest first)
+        ranked_levels = sorted(
+            eligible,
+            key=lambda lv: abs(close - lv[1]),
+        )
+        target_levels = ranked_levels[:capacity] if capacity > 0 else []
+        target_level_names = {lv[0] for lv in target_levels}
+
+        # Cancel any engine-placed working order whose level is NOT in the
+        # target set anymore (dropped out of the closest-N ranking).
+        if at_cap:
+            for existing_key in list(state.pending_entries.keys()):
+                ex_sym, ex_level = existing_key
+                if ex_sym != symbol:
+                    continue
+                if ex_level in target_level_names:
+                    continue
+                # This working order is no longer one of our target levels.
+                # Cancel it so the newer/closer level can take its slot.
+                existing = state.pending_entries[existing_key]
+                if not state.dry_run and existing.get('order_id') not in (None, 'DRY'):
+                    try:
+                        async with aiohttp.ClientSession() as http:
+                            await http.post(
+                                f'{base_url}/Order/cancel',
+                                json={'orderId': existing['order_id'], 'accountId': account.id},
+                                headers=hdrs,
+                            )
+                    except Exception as e:
+                        print(f"  [{symbol}] {ex_level} cancel failed: {e!r}")
+                print(f"  [{symbol}] ROTATE: dropped stale level {ex_level} @ {existing.get('entry_price')} (no longer in top-{capacity} closest)")
+                del state.pending_entries[existing_key]
+
+        # Place/update the target levels. place_or_update_entry itself
+        # dedupes on <2-tick moves so a reprice for an unchanged level
+        # is effectively a no-op.
+        for level_name, entry_price in target_levels:
             key = (symbol, level_name)
             if key in state.active_positions:
                 continue  # Already filled at this level
-            # Skip if we already have a limit order at this price
             if round(entry_price, 2) in existing_order_prices:
-                continue
-
-            has_existing_order = key in state.pending_entries
-
-            # Cap check: only BLOCK when we'd be ADDING a fresh level.
-            # Repricing an existing engine-tracked order at this level is
-            # always allowed, because it's a net-zero change to exposure
-            # (cancel + replace of the same 1-contract limit).
-            if total_exposure >= MAX_CONTRACTS_PER_INSTRUMENT and not has_existing_order:
-                print(f"  [{symbol}] CAP: skipping NEW level {level_name} @ {entry_price} (would exceed cap {MAX_CONTRACTS_PER_INSTRUMENT})")
-                continue
-
+                continue  # Already an order at that exact price
             await place_or_update_entry(client, account, symbol, level_name,
                                         contract_id, side, entry_price, tick_size)
-            # Only bump the exposure counter for a NEWLY placed order;
-            # a reprice keeps the same 1 contract in the book, no delta.
-            if not has_existing_order:
-                total_exposure += 1
 
     except Exception as e:
         print(f"  [{symbol}] scan error ({source}) (non-fatal): {e}")
