@@ -1083,20 +1083,94 @@ async def run_regime_session(
     return {"results": all_results, "regime": regime_state}
 
 
+# ---------------------------------------------------------------------------
+# Daemon scheduler
+# ---------------------------------------------------------------------------
+# Fires the regime session at each of these ET hours (:00 minute mark).
+# 1 AM  -> overnight bar (5PM ET yesterday -> 1AM ET) closes
+# 9 AM  -> morning bar (1AM -> 9AM ET) closes
+# 6 PM  -> RTH bar (9AM -> 5PM ET) closes; scan+dashboard only, no new orders
+SCHEDULE_ET_HOURS = (1, 9, 18)
+
+
+def _next_run_at_et(now_et):
+    """Return next datetime (ET tz-aware) when the regime should fire."""
+    tz = pytz.timezone("America/New_York")
+    today_candidates = [
+        tz.localize(datetime(now_et.year, now_et.month, now_et.day, h, 0, 0))
+        for h in SCHEDULE_ET_HOURS
+    ]
+    for candidate in today_candidates:
+        if candidate > now_et:
+            return candidate
+    # All of today's slots passed — use tomorrow's first slot
+    from datetime import timedelta
+    tomorrow = now_et + timedelta(days=1)
+    return tz.localize(datetime(tomorrow.year, tomorrow.month, tomorrow.day,
+                                SCHEDULE_ET_HOURS[0], 0, 0))
+
+
+async def daemon_loop(symbols, live, atr_mult, rr_ratio):
+    """Run forever: sleep until next schedule slot, then fire regime session."""
+    import time
+    tz = pytz.timezone("America/New_York")
+    print(f"\n  DAEMON MODE")
+    print(f"  Fires at ET hours: {SCHEDULE_ET_HOURS} "
+          f"({', '.join(f'{h}:00' for h in SCHEDULE_ET_HOURS)})")
+    print(f"  Symbols: {', '.join(symbols)}")
+    print(f"  Mode: {'LIVE' if live else 'DRY RUN'}")
+    print(f"  Ctrl+C to stop\n")
+
+    while True:
+        now_et = datetime.now(tz)
+        target = _next_run_at_et(now_et)
+        wait_sec = (target - now_et).total_seconds()
+        print(f"  [daemon] next fire: {target.strftime('%Y-%m-%d %H:%M %Z')} "
+              f"(in {wait_sec/3600:.1f}h)")
+
+        # Sleep in chunks so Ctrl+C is responsive
+        while wait_sec > 0:
+            chunk = min(wait_sec, 30)
+            await asyncio.sleep(chunk)
+            wait_sec -= chunk
+
+        # Fire the session. Wrap so a single failure doesn't kill the daemon.
+        try:
+            await run_regime_session(
+                symbols=symbols, live=live,
+                atr_mult=atr_mult, rr_ratio=rr_ratio,
+            )
+        except Exception as e:
+            print(f"  [daemon] session error (non-fatal): {e!r}")
+
+        # Small pad so we don't re-enter the same hour and re-fire
+        await asyncio.sleep(60)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Regime Session — 8h Filter → Limit Orders")
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--atr-mult", type=float, default=DEFAULT_ATR_MULTIPLIER)
     parser.add_argument("--rr-ratio", type=float, default=DEFAULT_RR_RATIO)
+    parser.add_argument("--daemon", action="store_true",
+                        help="Run continuously, self-fire at 1am / 9am / 6pm ET")
     args = parser.parse_args()
 
-    asyncio.run(run_regime_session(
-        symbols=args.symbols,
-        live=not args.dry_run,
-        atr_mult=args.atr_mult,
-        rr_ratio=args.rr_ratio,
-    ))
+    if args.daemon:
+        asyncio.run(daemon_loop(
+            symbols=args.symbols,
+            live=not args.dry_run,
+            atr_mult=args.atr_mult,
+            rr_ratio=args.rr_ratio,
+        ))
+    else:
+        asyncio.run(run_regime_session(
+            symbols=args.symbols,
+            live=not args.dry_run,
+            atr_mult=args.atr_mult,
+            rr_ratio=args.rr_ratio,
+        ))
 
 
 if __name__ == "__main__":
