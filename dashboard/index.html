@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Tzu Strategic Momentum Futures — Regime</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+:root{
+  --ink:#06070d; --surface:#0a0c14; --surface-2:#10131e; --hairline:#1a1f30;
+  --text:#e6e9f0; --text-2:#7a8295; --text-3:#4a5165;
+  --accent:#5b9eff; --accent-dim:#2a4d80;
+  --bull:#26a96c; --bear:#e0455c; --caution:#d4a017;
+}
+body{min-height:100dvh;font-family:'Inter',sans-serif;font-size:13px;color:var(--text);background:var(--ink);line-height:1.4}
+.mono{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums}
+.topbar{height:52px;display:flex;align-items:center;justify-content:space-between;padding:0 20px;background:var(--ink);border-bottom:1px solid var(--hairline);position:sticky;top:0;z-index:10}
+.topbar .brand{font-weight:700;font-size:14px;letter-spacing:0.5px}
+.topbar .brand span{color:var(--accent);margin-right:8px}
+.topbar .meta{display:flex;gap:24px;align-items:center;color:var(--text-2);font-size:12px}
+.topbar .meta strong{color:var(--text);font-weight:600}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;padding:16px;max-width:1600px;margin:0 auto}
+.card{background:var(--surface);border:1px solid var(--hairline);border-radius:4px;padding:14px;position:relative}
+.card h3{font-size:11px;font-weight:600;letter-spacing:1px;color:var(--text-2);text-transform:uppercase;margin-bottom:12px}
+.card .value{font-size:24px;font-weight:600}
+.card .sub{font-size:11px;color:var(--text-3);margin-top:2px}
+.col-3{grid-column:span 3}
+.col-4{grid-column:span 4}
+.col-6{grid-column:span 6}
+.col-8{grid-column:span 8}
+.col-12{grid-column:span 12}
+.bull{color:var(--bull)}
+.bear{color:var(--bear)}
+.caution{color:var(--caution)}
+.dim{color:var(--text-3)}
+
+/* Regime cards */
+.regime-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}
+.regime-card{background:var(--surface-2);border:1px solid var(--hairline);border-radius:4px;padding:16px;position:relative}
+.regime-card .sym{font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:600;letter-spacing:1px}
+.regime-card .mode{position:absolute;top:14px;right:14px;font-family:'JetBrains Mono',monospace;font-size:11px;font-weight:700;padding:3px 10px;border-radius:3px;letter-spacing:1px}
+.mode.BUY{background:rgba(38,169,108,0.18);color:var(--bull);border:1px solid rgba(38,169,108,0.4)}
+.mode.SELL{background:rgba(224,69,92,0.18);color:var(--bear);border:1px solid rgba(224,69,92,0.4)}
+.mode.NEUTRAL{background:rgba(122,130,149,0.15);color:var(--text-2);border:1px solid var(--hairline)}
+.regime-card .dss{margin-top:14px;display:flex;justify-content:space-between;align-items:baseline;padding-bottom:10px;border-bottom:1px solid var(--hairline)}
+.regime-card .dss-val{font-family:'JetBrains Mono',monospace;font-size:22px;font-weight:600}
+.regime-card .dss-label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:1px}
+.regime-card .details{margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px;font-size:11px}
+.regime-card .details span:nth-child(odd){color:var(--text-3);text-transform:uppercase;letter-spacing:0.5px}
+.regime-card .details span:nth-child(even){color:var(--text);font-family:'JetBrains Mono',monospace;text-align:right}
+
+/* Tables */
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;font-weight:600;color:var(--text-3);padding:8px 10px;border-bottom:1px solid var(--hairline);text-transform:uppercase;letter-spacing:0.5px;font-size:10px}
+td{padding:9px 10px;border-bottom:1px solid var(--hairline);font-family:'JetBrains Mono',monospace}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface-2)}
+td.right{text-align:right}
+td.center{text-align:center}
+.pill{display:inline-block;padding:2px 8px;border-radius:3px;font-size:10px;font-weight:600;letter-spacing:0.5px;font-family:'JetBrains Mono',monospace}
+.pill.BUY,.pill.LONG{background:rgba(38,169,108,0.15);color:var(--bull)}
+.pill.SELL,.pill.SHORT{background:rgba(224,69,92,0.15);color:var(--bear)}
+.pill.TARGET{background:rgba(38,169,108,0.15);color:var(--bull)}
+.pill.STOP{background:rgba(224,69,92,0.15);color:var(--bear)}
+
+/* Loading / empty */
+.empty{color:var(--text-3);text-align:center;padding:40px 20px;font-size:12px;font-style:italic}
+.footer{padding:20px;text-align:center;color:var(--text-3);font-size:11px}
+
+/* Countdown */
+.countdown{font-family:'JetBrains Mono',monospace;font-size:20px;font-weight:600;color:var(--accent)}
+.countdown-label{font-size:10px;color:var(--text-3);text-transform:uppercase;letter-spacing:1px;margin-top:2px}
+
+/* Progress bar for daily P&L cap */
+.progress{height:6px;background:var(--hairline);border-radius:3px;overflow:hidden;margin-top:8px}
+.progress .fill{height:100%;background:var(--accent);transition:width 0.3s}
+.progress .fill.warn{background:var(--caution)}
+.progress .fill.danger{background:var(--bear)}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="brand"><span>◆</span>TZU STRATEGIC MOMENTUM FUTURES</div>
+  <div class="meta">
+    <span>Account <strong id="account-name">—</strong></span>
+    <span>Balance <strong id="account-balance" class="mono">—</strong></span>
+    <span>MLL <strong id="account-mll" class="mono">—</strong></span>
+    <span id="now" class="mono">—</span>
+  </div>
+</div>
+
+<div class="grid">
+  <!-- Top KPI row -->
+  <div class="card col-3">
+    <h3>Today's P&amp;L</h3>
+    <div class="value mono" id="kpi-daily-pnl">—</div>
+    <div class="sub" id="kpi-daily-pnl-sub">— trades today</div>
+    <div class="progress"><div class="fill" id="kpi-daily-fill" style="width:0%"></div></div>
+  </div>
+  <div class="card col-3">
+    <h3>Cushion vs MLL</h3>
+    <div class="value mono" id="kpi-cushion">—</div>
+    <div class="sub" id="kpi-cushion-sub">—</div>
+  </div>
+  <div class="card col-3">
+    <h3>Open Brackets</h3>
+    <div class="value mono" id="kpi-open">—</div>
+    <div class="sub" id="kpi-open-sub">—</div>
+  </div>
+  <div class="card col-3">
+    <h3>Next Regime Fire</h3>
+    <div class="countdown" id="kpi-next-fire">—</div>
+    <div class="countdown-label" id="kpi-next-fire-time">—</div>
+  </div>
+
+  <!-- Regime per instrument -->
+  <div class="card col-12">
+    <h3>Regime — 8h DSS · Latching</h3>
+    <div class="regime-grid" id="regime-grid">
+      <div class="empty">Waiting for regime_state.json…</div>
+    </div>
+  </div>
+
+  <!-- Open orders -->
+  <div class="card col-12">
+    <h3>Open Bracket Orders</h3>
+    <table id="orders-table">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Side</th><th>Level</th>
+          <th class="right">Entry</th><th class="right">Stop</th><th class="right">Target</th>
+          <th class="right">$ Risk</th><th class="right">$ Target</th>
+          <th>Placed</th>
+        </tr>
+      </thead>
+      <tbody id="orders-body">
+        <tr><td colspan="9" class="empty">Waiting for orders_state.json…</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Recent trades -->
+  <div class="card col-12">
+    <h3>Recent Trades — Last 20</h3>
+    <table id="trades-table">
+      <thead>
+        <tr>
+          <th>Symbol</th><th>Side</th><th>Level</th>
+          <th class="right">Entry</th><th class="right">Exit</th>
+          <th class="right">P&amp;L</th><th>Result</th>
+          <th class="right">Exit Time (ET)</th>
+        </tr>
+      </thead>
+      <tbody id="trades-body">
+        <tr><td colspan="8" class="empty">Waiting for trade_log.json…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="footer">
+  <span class="dim">Reads state from</span> <span class="mono" id="footer-root">—</span><br>
+  <span class="dim">Refreshes every 3 seconds</span>
+</div>
+
+<script>
+const fmt$ = (v) => v == null ? '—' : (v < 0 ? '-$' : '$') + Math.abs(v).toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2});
+const fmtNum = (v, d=2) => v == null ? '—' : Number(v).toLocaleString(undefined, {minimumFractionDigits:d, maximumFractionDigits:d});
+const fmtTime = (iso) => {
+  if (!iso) return '—';
+  try {
+    return new Intl.DateTimeFormat('en-US', {timeZone:'America/New_York', month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'}).format(new Date(iso));
+  } catch { return iso; }
+};
+
+function classForPnl(v) { return v > 0 ? 'bull' : (v < 0 ? 'bear' : 'dim'); }
+
+function renderRegime(regime) {
+  const grid = document.getElementById('regime-grid');
+  const instruments = regime?.instruments || {};
+  const symbols = Object.keys(instruments);
+  if (symbols.length === 0) {
+    grid.innerHTML = '<div class="empty">No regime state yet — daemon has not fired.</div>';
+    return;
+  }
+  grid.innerHTML = symbols.map(sym => {
+    const r = instruments[sym];
+    const modeClass = r.mode || 'NEUTRAL';
+    const dssColor = r.dss_signal > 0 ? 'bull' : (r.dss_signal < 0 ? 'bear' : 'dim');
+    return `
+      <div class="regime-card">
+        <div class="sym">${sym}</div>
+        <div class="mode ${modeClass}">${r.mode || '—'}</div>
+        <div class="dss">
+          <div>
+            <div class="dss-label">DSS Signal</div>
+            <div class="dss-val ${dssColor}">${r.dss_signal != null ? (r.dss_signal > 0 ? '+' : '') + r.dss_signal : '—'}</div>
+          </div>
+          <div>
+            <div class="dss-label">Strength</div>
+            <div class="dss-val">${r.strength || '—'}</div>
+          </div>
+        </div>
+        <div class="details">
+          <span>Regime</span><span>${r.regime || '—'}</span>
+          <span>Latched</span><span>${r.latched ? 'YES' : 'no'}</span>
+          <span>Trigger</span><span>${r.trigger || '—'}</span>
+          <span>Computed</span><span>${fmtTime(r.computed_at)}</span>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderOrders(orders) {
+  const body = document.getElementById('orders-body');
+  const pending = orders?.pending_limits || {};
+  const rows = Object.values(pending);
+  if (rows.length === 0) {
+    body.innerHTML = '<tr><td colspan="9" class="empty">No open bracket orders.</td></tr>';
+    return;
+  }
+  body.innerHTML = rows.map(o => `
+    <tr>
+      <td>${o.symbol || '—'}</td>
+      <td><span class="pill ${o.side_str || ''}">${o.side_str || '—'}</span></td>
+      <td>${o.level || '—'}</td>
+      <td class="right">${fmtNum(o.entry)}</td>
+      <td class="right bear">${fmtNum(o.stop)}</td>
+      <td class="right bull">${fmtNum(o.target)}</td>
+      <td class="right bear">${fmt$(o.dollar_risk)}</td>
+      <td class="right bull">${fmt$(o.dollar_target)}</td>
+      <td>${fmtTime(o.placed_at)}</td>
+    </tr>
+  `).join('');
+}
+
+function renderTrades(trades) {
+  const body = document.getElementById('trades-body');
+  if (!trades || trades.length === 0) {
+    body.innerHTML = '<tr><td colspan="8" class="empty">No trades yet.</td></tr>';
+    return;
+  }
+  body.innerHTML = trades.map(t => `
+    <tr>
+      <td>${t.symbol}</td>
+      <td><span class="pill ${t.side}">${t.side}</span></td>
+      <td>${t.level || '—'}</td>
+      <td class="right">${fmtNum(t.entry)}</td>
+      <td class="right">${fmtNum(t.exit)}</td>
+      <td class="right ${classForPnl(t.pnl)}">${fmt$(t.pnl)}</td>
+      <td><span class="pill ${t.result === 'TARGET' ? 'TARGET' : 'STOP'}">${t.result}</span></td>
+      <td class="right">${fmtTime(t.exit_time)}</td>
+    </tr>
+  `).join('');
+}
+
+function renderCountdown(next) {
+  const el = document.getElementById('kpi-next-fire');
+  const label = document.getElementById('kpi-next-fire-time');
+  if (!next) { el.textContent = '—'; label.textContent = '—'; return; }
+  const ms = next.ms_until;
+  if (ms <= 0) { el.textContent = 'FIRING'; label.textContent = ''; return; }
+  const h = Math.floor(ms / 3600000);
+  const m = Math.floor((ms % 3600000) / 60000);
+  const s = Math.floor((ms % 60000) / 1000);
+  el.textContent = `${h}h ${String(m).padStart(2,'0')}m ${String(s).padStart(2,'0')}s`;
+  label.textContent = fmtTime(next.iso) + ' ET';
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/snapshot');
+    const d = await r.json();
+
+    // Topbar
+    document.getElementById('now').textContent = fmtTime(d.now) + ' ET';
+    document.getElementById('footer-root').textContent = d.engine_root;
+
+    const tracker = d.tracker || {};
+    document.getElementById('account-name').textContent = tracker.account_name || 'combine';
+    document.getElementById('account-balance').textContent = fmt$(tracker.peak_eod_balance || tracker.starting_balance);
+    document.getElementById('account-mll').textContent = fmt$(tracker.current_mll);
+
+    // KPIs
+    const dailyPnl = d.daily?.pnl || 0;
+    const dailyCap = d.daily?.cap || 1400;
+    const dailyEl = document.getElementById('kpi-daily-pnl');
+    dailyEl.textContent = fmt$(dailyPnl);
+    dailyEl.className = 'value mono ' + classForPnl(dailyPnl);
+    document.getElementById('kpi-daily-pnl-sub').textContent = `${d.daily?.trade_count || 0} trades · cap ${fmt$(dailyCap)}`;
+    const pct = Math.max(0, Math.min(100, (Math.abs(dailyPnl) / dailyCap) * 100));
+    const fill = document.getElementById('kpi-daily-fill');
+    fill.style.width = pct + '%';
+    fill.className = 'fill' + (pct > 80 ? ' danger' : (pct > 50 ? ' warn' : ''));
+
+    const balance = tracker.peak_eod_balance || tracker.starting_balance || 0;
+    const cushion = balance - (tracker.current_mll || 0);
+    const cushEl = document.getElementById('kpi-cushion');
+    cushEl.textContent = fmt$(cushion);
+    cushEl.className = 'value mono ' + (cushion > 1000 ? 'bull' : (cushion > 0 ? 'caution' : 'bear'));
+    document.getElementById('kpi-cushion-sub').textContent = `MLL floor ${fmt$(tracker.current_mll)}${tracker.mll_locked ? ' (locked)' : ' (trailing)'}`;
+
+    const openCount = Object.keys(d.orders?.pending_limits || {}).length;
+    document.getElementById('kpi-open').textContent = openCount;
+    document.getElementById('kpi-open-sub').textContent = `Total exec trades: ${d.total_trades || 0}`;
+
+    renderCountdown(d.next_fire);
+    renderRegime(d.regime);
+    renderOrders(d.orders);
+    renderTrades(d.recent_trades);
+  } catch (e) {
+    console.warn('refresh failed', e);
+  }
+}
+
+refresh();
+setInterval(refresh, 3000);
+// Update countdown every second even between polls
+setInterval(async () => {
+  try {
+    const r = await fetch('/api/snapshot');
+    const d = await r.json();
+    renderCountdown(d.next_fire);
+  } catch {}
+}, 1000);
+</script>
+</body>
+</html>
