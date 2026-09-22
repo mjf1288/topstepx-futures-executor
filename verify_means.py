@@ -114,6 +114,24 @@ def main():
     args = parser.parse_args()
     api = from_env()
     now_utc = datetime.now(timezone.utc)
+
+    # Audit the month the broker says is live, not a hardcoded one. Without
+    # this the audit can silently pass against an expired contract.
+    wanted = [args.symbol] if args.symbol else list(CONTRACT_MAP)
+    resolved, failures = engine.resolve_active_contracts(api, wanted, now_utc)
+    for sym, (cid, expiry, flagged) in resolved.items():
+        if CONTRACT_MAP[sym] != cid:
+            print(f"  {sym}: contract month {CONTRACT_MAP[sym]} -> {cid}")
+        CONTRACT_MAP[sym] = cid
+        if not flagged:
+            print(f"  {sym}: {cid} is not broker-flagged active "
+                  f"(expires {expiry.strftime('%Y-%m-%d') if expiry else 'unknown'})")
+    if failures:
+        for sym, reason in failures.items():
+            print(f"  {sym}: UNRESOLVED - {reason}")
+        raise RuntimeError(
+            "cannot audit without a live contract month: " + ", ".join(failures))
+
     month_start = reference_window_start(now_utc)
     if args.hourly_days is not None:
         if args.hourly_days <= 0:

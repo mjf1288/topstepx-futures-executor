@@ -47,15 +47,25 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 # ─────────────────────────────────────────────────────────────
 SYMBOLS = ["MNQ", "MES", "MYM", "MGC", "MCL"]
 
+# (active_contract, prior_contract, tick_size, tick_value)
+#
+# This is only a FALLBACK. resolve_active_contracts() asks the broker which
+# month is actually active at startup and overwrites slot 0, because these
+# months go stale: MYM/MNQ/MES roll quarterly, MGC every two months, and MCL
+# EVERY month. A stale entry here means trading an expired contract.
+# Slot 1 is the month immediately BEFORE the active one (build2.py stitches
+# older history from it) and is not used for order routing.
+# Verified 2026-09-22: MYM U26 expired 09-18, MCL V26 expired 09-21.
 CONTRACT_MAP = {
     'MNQ': ('CON.F.US.MNQ.Z26', 'CON.F.US.MNQ.U26', 0.25, 0.50),
     'MES': ('CON.F.US.MES.Z26', 'CON.F.US.MES.U26', 0.25, 1.25),
-    'MYM': ('CON.F.US.MYM.U26', 'CON.F.US.MYM.Z26', 1.0, 0.50),
-    'MGC': ('CON.F.US.MGC.V26', 'CON.F.US.MGC.Z26', 0.10, 1.00),
-    # MCL (Micro Crude Oil) rolls monthly — update these first-of-each-month.
-    # V26 = October 2026, X26 = November 2026.
-    'MCL': ('CON.F.US.MCL.V26', 'CON.F.US.MCL.X26', 0.01, 1.00),
+    'MYM': ('CON.F.US.MYM.Z26', 'CON.F.US.MYM.U26', 1.0, 0.50),
+    'MGC': ('CON.F.US.MGC.V26', 'CON.F.US.MGC.Q26', 0.10, 1.00),
+    'MCL': ('CON.F.US.MCL.X26', 'CON.F.US.MCL.V26', 0.01, 1.00),
 }
+
+# Futures month codes, in calendar order.
+MONTH_CODES = "FGHJKMNQUVXZ"
 
 # Combined cap: total contracts per instrument across BOTH the mean-level
 # engine AND the VWAP engine. Each engine independently queries the broker
@@ -77,6 +87,97 @@ MIN_SAMPLES_CMM = 24  # 24 completed hourly bars; preserve existing warm-up gate
 
 ET = pytz.timezone("America/New_York")
 CT = pytz.timezone("America/Chicago")
+
+
+# ─────────────────────────────────────────────────────────────
+# CONTRACT RESOLUTION
+# ─────────────────────────────────────────────────────────────
+def _parse_broker_datetime(value):
+    """Parse a broker ISO timestamp to aware UTC, or None if unusable."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def resolve_active_contracts(client, symbols, now_utc=None):
+    """Ask the broker which contract month is live for each root symbol.
+
+    MCL rolls monthly and the index/metal roots roll quarterly or bi-monthly,
+    so a hardcoded month silently becomes an expired contract. This queries
+    /Contract/search and picks, among contracts whose lastTradingDate is still
+    in the future, the broker's flagged active contract, then the nearest
+    expiry as a tiebreak.
+
+    Returns (resolved, failures). `resolved` maps symbol -> (contract_id,
+    expiry, was_flagged_active). A symbol in `failures` must NOT be traded:
+    routing to the wrong month is worse than not trading it.
+    """
+    now = now_utc or datetime.now(timezone.utc)
+    resolved, failures = {}, {}
+    for symbol in symbols:
+        try:
+            candidates = client.search_contract(symbol)
+        except Exception as exc:  # network/auth/shape — never guess past it
+            failures[symbol] = f"contract search failed: {exc!r}"
+            continue
+        if not isinstance(candidates, list) or not candidates:
+            failures[symbol] = "contract search returned nothing"
+            continue
+
+        best = None
+        expired_seen = 0
+        for contract in candidates:
+            if not isinstance(contract, dict):
+                continue
+            cid = str(contract.get('id') or '')
+            parts = cid.split('.')
+            # Require exactly CON.F.US.<ROOT>.<MonthCode><YY> for this root, so
+            # a spread or a different product can never be selected.
+            if len(parts) != 5 or parts[3] != symbol:
+                continue
+            month = parts[4]
+            if len(month) != 3 or month[0] not in MONTH_CODES or not month[1:].isdigit():
+                continue
+            expiry = _parse_broker_datetime(contract.get('lastTradingDate'))
+            if expiry is not None and expiry <= now:
+                expired_seen += 1
+                continue
+            flagged = bool(contract.get('activeContract'))
+            # Prefer the broker's active flag, then the nearest expiry. Unknown
+            # expiry sorts last so a dated contract always wins.
+            rank = (0 if flagged else 1, expiry or datetime.max.replace(tzinfo=timezone.utc))
+            if best is None or rank < best[0]:
+                best = (rank, cid, expiry, flagged)
+
+        if best is None:
+            failures[symbol] = (
+                f"no unexpired {symbol} contract in {len(candidates)} result(s)"
+                + (f"; {expired_seen} already expired" if expired_seen else "")
+            )
+            continue
+        resolved[symbol] = (best[1], best[2], best[3])
+    return resolved, failures
+
+
+def apply_resolved_contracts(resolved):
+    """Point CONTRACT_MAP slot 0 at the broker's active month, keeping ticks."""
+    changes = {}
+    for symbol, (cid, _expiry, _flagged) in resolved.items():
+        if symbol not in CONTRACT_MAP:
+            continue
+        current, prior, tick, tick_value = CONTRACT_MAP[symbol]
+        if cid == current:
+            continue
+        # The month we were about to trade becomes the prior month.
+        CONTRACT_MAP[symbol] = (cid, current, tick, tick_value)
+        changes[symbol] = (current, cid)
+    return changes
 
 
 # ─────────────────────────────────────────────────────────────
@@ -637,6 +738,30 @@ async def main(modes: dict, dry_run: bool = False):
         account = client.get_account_info()
         print(f"  Account: {account.name}")
         print(f"  Balance: ${account.balance:,.2f}")
+
+        # Resolve live contract months BEFORE any bars or orders. MCL rolls
+        # monthly, so a stale CONTRACT_MAP would route to an expired contract.
+        print(f"\n  Resolving contract months...")
+        resolved, failures = resolve_active_contracts(client, active_syms)
+        changes = apply_resolved_contracts(resolved)
+        for sym in active_syms:
+            if sym in resolved:
+                cid, expiry, flagged = resolved[sym]
+                exp_s = expiry.strftime('%Y-%m-%d') if expiry else 'unknown'
+                tag = '' if flagged else '  [not broker-flagged active]'
+                moved = f"  (was {changes[sym][0].split('.')[-1]})" if sym in changes else ''
+                print(f"    {sym}: {cid}  expires {exp_s}{moved}{tag}")
+        for sym, reason in failures.items():
+            print(f"    {sym}: UNRESOLVED — {reason}")
+        if failures:
+            # Refuse the symbol rather than trade a guessed month.
+            for sym in failures:
+                state.modes.pop(sym, None)
+            active_syms = list(state.modes.keys())
+            print(f"    Skipping {', '.join(failures)} this session.")
+            if not active_syms:
+                print("\n  No tradeable symbols after contract resolution. Exiting.")
+                return
 
         # Seed historical data. Uses client.get_session_token() +
         # client.base_url — provided by SDK-compat shim on TopstepAPI.

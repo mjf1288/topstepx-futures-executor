@@ -57,6 +57,9 @@ from broker bars, refetched each cycle.
 The loop starts at line 699. Cadence is monotonic (`next_refresh += 60`), so broker latency
 doesn't drift the period, and it won't burst catch-up requests if the broker was slow.
 
+Startup order is: authenticate → **resolve contract months (§5a)** → seed history and ATR →
+subscribe to the stream → enter the loop.
+
 Per symbol, `refresh_and_reprice()` (line 372) holds a per-symbol lock and runs two phases
 in strict order:
 
@@ -99,6 +102,28 @@ All are **running cumulative averages of closes**, never `(high+low)/2`.
   This is the bug fixed earlier — a 45-day lookback could not cover a full prior month.
 - Warm-up gates exist because a 1-sample CMM equals current price and would trigger an
   instant fill with no edge (observed 2026-06-01 globex open).
+
+---
+
+## 5a. Contract resolution (startup)
+
+MCL rolls **monthly**, MGC every two months, and the index roots quarterly — so any hardcoded
+month eventually becomes an expired contract. Before fetching a single bar,
+`resolve_active_contracts()` (line 108) queries `/Contract/search` per root and selects:
+
+1. only ids matching exactly `CON.F.US.<ROOT>.<MonthCode><YY>` — never a spread or another
+   product;
+2. only contracts whose `lastTradingDate` is still in the future;
+3. the broker's `activeContract` flag first, nearest expiry as the tiebreak.
+
+`apply_resolved_contracts()` then rewrites slot 0 of `CONTRACT_MAP`, demotes the previous
+month into slot 1, and preserves tick size and tick value.
+
+**A symbol that cannot be resolved is dropped from the session**, with the reason printed. If
+none resolve, the engine exits. Routing an order to the wrong month is worse than not trading.
+`verify_means.py` resolves the same way, so an audit cannot pass against a dead contract.
+
+`CONTRACT_MAP` remains in the file as a documented fallback and as the source of tick data.
 
 ---
 
@@ -186,7 +211,7 @@ State is in-memory only; broker reconciliation each cycle is what makes restarts
 | PMM covers the whole prior month | ✅ full session-open boundary |
 | `pending_entries` clears on fill/cancel | ✅ |
 | Running cumulative close average | ✅ not H/L midpoint |
-| Contracts on Z26 | ⚠️ MNQ and MES yes; **MYM and MCL stale** (§11.3) |
+| Correct contract month per symbol | ✅ resolved from the broker at startup (§5a) |
 | Mean-level strength priority honoured | ✅ as of `03b9769` |
 | Execution-only, stops attached manually | ✅ no brackets placed |
 | 3 consecutive losses stops the symbol | ❌ **dead code** (§11.1) |
@@ -224,7 +249,13 @@ every order logs `ATR pending`.
 Low severity today because ATR is display-only in execution-only mode — but it is the number
 you use to size the manual stop.
 
-### 11.3 Two contract months are stale
+### 11.3 Contract months — RESOLVED 2026-09-22
+
+Previously MYM's tuple had current and prior inverted (pointing at U26, expired 2026-09-18)
+and MCL sat on V26 (expired 2026-09-21). Both are fixed, and the engine no longer trusts the
+static map for routing — see §5a. Historical note follows.
+
+#### What was wrong
 
 ```python
 'MNQ': ('CON.F.US.MNQ.Z26', 'CON.F.US.MNQ.U26', 0.25, 0.50)   # correct: Z26 current
@@ -238,7 +269,9 @@ MYM's tuple has current and prior swapped relative to MNQ/MES: it points at **U2
 would target an expired contract. MCL V26 (October crude) expires around 2026-09-22, so it
 needs rolling to X26 now.
 
-MGC V26 (October gold) is still fine.
+MGC V26 (October gold) was still valid, but which of V26/Z26 carries the volume is a
+judgement call — which is exactly why the active month now comes from the broker rather than
+from a constant in this file.
 
 ### 11.4 Module docstring contradicts the code
 

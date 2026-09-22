@@ -59,6 +59,14 @@ class FixtureClient:
     def get_session_token(self):
         return "offline-test-token"
 
+    def search_contract(self, symbol):
+        # Mirrors /Contract/search: the live month for this root, unexpired.
+        return [{
+            "id": engine.CONTRACT_MAP[symbol][0],
+            "activeContract": True,
+            "lastTradingDate": (NOW + timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }]
+
     def get_bars(self, **kwargs):
         self.calls.append(kwargs)
         assert kwargs["contract_id"] == CID
@@ -511,6 +519,119 @@ class OrderTests(BaseTests, unittest.IsolatedAsyncioTestCase):
                 for _ in range(3)])
         self.assertEqual(maximum, 1)
 
+
+
+class ContractResolutionTests(unittest.TestCase):
+    """The engine must never route an order to an expired or foreign contract."""
+
+    NOW = datetime(2026, 9, 22, 18, 0, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.original = dict(engine.CONTRACT_MAP)
+        self.addCleanup(lambda: engine.CONTRACT_MAP.update(self.original))
+
+    @staticmethod
+    def client(contracts, raises=False):
+        class C:
+            def search_contract(self, symbol):
+                if raises:
+                    raise RuntimeError("boom")
+                return contracts
+        return C()
+
+    @staticmethod
+    def contract(cid, expiry, active=False):
+        return {"id": cid, "activeContract": active, "lastTradingDate": expiry}
+
+    def test_expired_month_is_never_selected(self):
+        client = self.client([
+            self.contract("CON.F.US.MCL.V26", "2026-09-21T18:30:00Z", active=True),
+            self.contract("CON.F.US.MCL.X26", "2026-10-19T18:30:00Z"),
+        ])
+        resolved, failures = engine.resolve_active_contracts(client, ["MCL"], self.NOW)
+        self.assertEqual(failures, {})
+        self.assertEqual(resolved["MCL"][0], "CON.F.US.MCL.X26")
+
+    def test_broker_active_flag_wins_over_nearer_expiry(self):
+        client = self.client([
+            self.contract("CON.F.US.MGC.V26", "2026-10-28T18:30:00Z"),
+            self.contract("CON.F.US.MGC.Z26", "2026-12-29T18:30:00Z", active=True),
+        ])
+        resolved, _ = engine.resolve_active_contracts(client, ["MGC"], self.NOW)
+        self.assertEqual(resolved["MGC"][0], "CON.F.US.MGC.Z26")
+        self.assertTrue(resolved["MGC"][2])
+
+    def test_nearest_expiry_when_nothing_flagged(self):
+        client = self.client([
+            self.contract("CON.F.US.MYM.H27", "2027-03-19T14:30:00Z"),
+            self.contract("CON.F.US.MYM.Z26", "2026-12-18T14:30:00Z"),
+        ])
+        resolved, _ = engine.resolve_active_contracts(client, ["MYM"], self.NOW)
+        self.assertEqual(resolved["MYM"][0], "CON.F.US.MYM.Z26")
+
+    def test_foreign_roots_and_spreads_are_ignored(self):
+        client = self.client([
+            self.contract("CON.F.US.MNQ.Z26", "2026-12-18T14:30:00Z", active=True),
+            self.contract("CON.F.US.MYM.Z26", "2026-12-18T14:30:00Z", active=True),
+            self.contract("CON.S.US.MYM.Z26.H27", "2027-03-19T14:30:00Z", active=True),
+            self.contract("CON.F.US.MYM.BADMONTH", "2027-03-19T14:30:00Z", active=True),
+        ])
+        resolved, failures = engine.resolve_active_contracts(client, ["MYM"], self.NOW)
+        self.assertEqual(failures, {})
+        self.assertEqual(resolved["MYM"][0], "CON.F.US.MYM.Z26")
+
+    def test_all_expired_is_a_failure_not_a_guess(self):
+        client = self.client([
+            self.contract("CON.F.US.MYM.U26", "2026-09-18T14:30:00Z", active=True),
+        ])
+        resolved, failures = engine.resolve_active_contracts(client, ["MYM"], self.NOW)
+        self.assertEqual(resolved, {})
+        self.assertIn("MYM", failures)
+        self.assertIn("expired", failures["MYM"])
+
+    def test_search_failure_is_reported_not_swallowed(self):
+        resolved, failures = engine.resolve_active_contracts(
+            self.client([], raises=True), ["MCL"], self.NOW)
+        self.assertEqual(resolved, {})
+        self.assertIn("contract search failed", failures["MCL"])
+
+    def test_empty_result_is_a_failure(self):
+        resolved, failures = engine.resolve_active_contracts(
+            self.client([]), ["MCL"], self.NOW)
+        self.assertEqual(resolved, {})
+        self.assertIn("nothing", failures["MCL"])
+
+    def test_missing_expiry_does_not_beat_a_dated_contract(self):
+        client = self.client([
+            self.contract("CON.F.US.MCL.Z26", None),
+            self.contract("CON.F.US.MCL.X26", "2026-10-19T18:30:00Z"),
+        ])
+        resolved, _ = engine.resolve_active_contracts(client, ["MCL"], self.NOW)
+        self.assertEqual(resolved["MCL"][0], "CON.F.US.MCL.X26")
+
+    def test_apply_preserves_ticks_and_demotes_old_month(self):
+        engine.CONTRACT_MAP["MCL"] = ("CON.F.US.MCL.V26", "CON.F.US.MCL.U26", 0.01, 1.00)
+        changes = engine.apply_resolved_contracts(
+            {"MCL": ("CON.F.US.MCL.X26", self.NOW, True)})
+        self.assertEqual(engine.CONTRACT_MAP["MCL"],
+                         ("CON.F.US.MCL.X26", "CON.F.US.MCL.V26", 0.01, 1.00))
+        self.assertEqual(changes["MCL"], ("CON.F.US.MCL.V26", "CON.F.US.MCL.X26"))
+
+    def test_apply_is_a_noop_when_month_already_correct(self):
+        before = engine.CONTRACT_MAP["MNQ"]
+        changes = engine.apply_resolved_contracts(
+            {"MNQ": (before[0], self.NOW, True)})
+        self.assertEqual(changes, {})
+        self.assertEqual(engine.CONTRACT_MAP["MNQ"], before)
+
+    def test_shipped_fallback_map_has_sane_tick_data(self):
+        expected = {"MNQ": (0.25, 0.50), "MES": (0.25, 1.25), "MYM": (1.0, 0.50),
+                    "MGC": (0.10, 1.00), "MCL": (0.01, 1.00)}
+        for sym, (tick, value) in expected.items():
+            active, prior, got_tick, got_value = engine.CONTRACT_MAP[sym]
+            self.assertEqual((got_tick, got_value), (tick, value), sym)
+            self.assertTrue(active.startswith(f"CON.F.US.{sym}."), sym)
+            self.assertNotEqual(active, prior, sym)
 
 if __name__ == "__main__":
     unittest.main()
