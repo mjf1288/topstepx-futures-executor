@@ -70,10 +70,11 @@ MONTH_CODES = "FGHJKMNQUVXZ"
 # Caps are counted from broker truth: positions + working entry orders on the
 # account, either side. A new order is refused if it would breach either cap.
 # This engine runs alone — there is no second engine sharing the account.
-# 1 lot per symbol across 5 symbols = 5 lots, which is exactly the 50K combine
-# max position. MAX_TOTAL_CONTRACTS is the account-wide backstop: without it,
-# per-symbol caps multiply by the symbol count and blow through the combine.
-MAX_CONTRACTS_PER_INSTRUMENT = 1
+# Per-symbol 2 lets two mean levels rest on one symbol at the same time.
+# 2 x 5 symbols = 10, so MAX_TOTAL_CONTRACTS is the binding constraint, not a
+# formality: whichever symbols fill first consume the shared budget of 5 and
+# the rest are refused. Without it the per-symbol caps would breach the combine.
+MAX_CONTRACTS_PER_INSTRUMENT = 2
 MAX_TOTAL_CONTRACTS = 5  # 50K combine max position, all symbols combined
 CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 
@@ -573,14 +574,6 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         if not (pos_query_ok and ord_query_ok):
             return
 
-        # Account-wide cap. Counts every symbol's positions and working entry
-        # orders, including any placed manually, so 5 symbols cannot each claim
-        # their own per-symbol allowance and breach the combine together.
-        if total_pos_count + total_order_count + CONTRACTS_PER_ORDER > MAX_TOTAL_CONTRACTS:
-            print(f"  [{symbol}] SKIP — account at total cap "
-                  f"({total_pos_count} pos + {total_order_count} orders / {MAX_TOTAL_CONTRACTS})")
-            return
-
         # Filled/cancelled/expired orders disappear from searchOpen. Prune
         # before adoption AND price dedup, using the same validated snapshot.
         open_by_id = {str(o['id']): o for o in orders}
@@ -620,6 +613,7 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
                 size = open_by_id.get(order_id, {}).get('size', CONTRACTS_PER_ORDER)
                 if await cancel_pending_entry(client, account, key):
                     open_order_count -= size
+                    total_order_count -= size
                     orders = [o for o in orders if str(o['id']) != order_id]
         for level_name, entry_price in by_distance:
             key = (symbol, level_name)
@@ -659,15 +653,26 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
             if key in state.active_positions:
                 continue  # Already filled at this level
             has_existing_order = key in state.pending_entries
-            # If no existing order tracked AND we've hit position cap, skip
-            # placing a brand-new order (would be rejected anyway).
-            if (not has_existing_order and
-                    open_pos_count + open_order_count + CONTRACTS_PER_ORDER > MAX_CONTRACTS_PER_INSTRUMENT):
-                continue
+            # Only brand-new orders consume cap; repricing an existing one is a
+            # cancel+replace and adds no exposure, so it is always allowed.
+            # Both caps are checked per placement, and the counters are bumped
+            # after each one — otherwise a single cycle could place several
+            # orders that were each individually under the cap.
+            if not has_existing_order:
+                if (open_pos_count + open_order_count + CONTRACTS_PER_ORDER
+                        > MAX_CONTRACTS_PER_INSTRUMENT):
+                    continue
+                if (total_pos_count + total_order_count + CONTRACTS_PER_ORDER
+                        > MAX_TOTAL_CONTRACTS):
+                    print(f"  [{symbol}] {level_name} skipped — account at total cap "
+                          f"({total_pos_count} pos + {total_order_count} orders "
+                          f"/ {MAX_TOTAL_CONTRACTS})")
+                    continue
             placed = await place_or_update_entry(client, account, symbol, level_name,
                                                  contract_id, side, entry_price, tick_size)
             if placed and not has_existing_order:
                 open_order_count += CONTRACTS_PER_ORDER
+                total_order_count += CONTRACTS_PER_ORDER
 
     except Exception as e:
         print(f"  [{symbol}] scan error ({source}) (non-fatal): {e}")
