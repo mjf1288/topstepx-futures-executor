@@ -67,12 +67,14 @@ CONTRACT_MAP = {
 # Futures month codes, in calendar order.
 MONTH_CODES = "FGHJKMNQUVXZ"
 
-# Combined cap: total contracts per instrument across BOTH the mean-level
-# engine AND the VWAP engine. Each engine independently queries the broker
-# for total exposure (positions + working orders on that contract, any side)
-# and refuses to place a new order that would push the total above this cap.
-# Set to 2 so mean + VWAP together never exceed 2 contracts per symbol.
-MAX_CONTRACTS_PER_INSTRUMENT = 2  # combined cap with VWAP engine (was 4 solo)
+# Caps are counted from broker truth: positions + working entry orders on the
+# account, either side. A new order is refused if it would breach either cap.
+# This engine runs alone — there is no second engine sharing the account.
+# 1 lot per symbol across 5 symbols = 5 lots, which is exactly the 50K combine
+# max position. MAX_TOTAL_CONTRACTS is the account-wide backstop: without it,
+# per-symbol caps multiply by the symbol count and blow through the combine.
+MAX_CONTRACTS_PER_INSTRUMENT = 1
+MAX_TOTAL_CONTRACTS = 5  # 50K combine max position, all symbols combined
 CONTRACTS_PER_ORDER = 1            # 1 contract per entry
 
 ATR_MULTIPLIER = 0.382             # ~38.2% of daily ATR (fib-based tight stop)
@@ -523,7 +525,9 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
         # Count open limit orders for this instrument (entry orders only, type=1=Limit)
+        # and, separately, account-wide exposure for the total cap.
         open_order_count = 0
+        total_order_count = 0
         ord_query_ok = False
         try:
             async with aiohttp.ClientSession() as http:
@@ -533,8 +537,12 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
                 ord_data = await resp.json()
             orders = broker_rows(ord_data, 'orders')
             for o in orders:
-                if o.get('contractId', '') == contract_id and o.get('type') == 1:
-                    open_order_count += abs(o.get('size', 1))
+                if o.get('type') != 1:
+                    continue
+                size = abs(o.get('size', 1))
+                total_order_count += size
+                if o.get('contractId', '') == contract_id:
+                    open_order_count += size
             ord_query_ok = True
         except Exception as e:
             print(f"  [{symbol}] SKIP — order query failed: {e!r}")
@@ -542,6 +550,7 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         # Read positions AFTER orders. If an entry filled between these reads,
         # it is counted conservatively in both snapshots, not missed in both.
         open_pos_count = 0
+        total_pos_count = 0
         pos_query_ok = False
         try:
             async with aiohttp.ClientSession() as http:
@@ -551,8 +560,10 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
                 pos_data = await resp.json()
             positions = broker_rows(pos_data, 'positions')
             for p in positions:
+                size = abs(p.get('size', 0))
+                total_pos_count += size
                 if p.get('contractId', '') == contract_id:
-                    open_pos_count += abs(p.get('size', 0))
+                    open_pos_count += size
             pos_query_ok = True
         except Exception as e:
             print(f"  [{symbol}] SKIP — position query failed: {e!r}")
@@ -560,6 +571,14 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         # Hard rule: if EITHER query failed, do not place new orders this bar.
         # The cap is only meaningful when we can see both positions and orders.
         if not (pos_query_ok and ord_query_ok):
+            return
+
+        # Account-wide cap. Counts every symbol's positions and working entry
+        # orders, including any placed manually, so 5 symbols cannot each claim
+        # their own per-symbol allowance and breach the combine together.
+        if total_pos_count + total_order_count + CONTRACTS_PER_ORDER > MAX_TOTAL_CONTRACTS:
+            print(f"  [{symbol}] SKIP — account at total cap "
+                  f"({total_pos_count} pos + {total_order_count} orders / {MAX_TOTAL_CONTRACTS})")
             return
 
         # Filled/cancelled/expired orders disappear from searchOpen. Prune

@@ -123,8 +123,8 @@ class Broker:
         raise AssertionError(f"Unexpected broker call: {path}")
 
 
-def order(order_id=10, price=99, side=0, size=1):
-    return {"id": order_id, "contractId": CID, "type": 1,
+def order(order_id=10, price=99, side=0, size=1, contract=CID):
+    return {"id": order_id, "contractId": contract, "type": 1,
             "side": side, "size": size, "limitPrice": price}
 
 
@@ -415,12 +415,10 @@ class OrderTests(BaseTests, unittest.IsolatedAsyncioTestCase):
     async def test_cap_counts_positions_working_sizes_and_new_placements(self):
         engine.state.pdm["MES"] = 98
         engine.state.cmm["MES"] = 97
+        # Per-symbol cap is 1 lot, so an existing position leaves no room.
         broker = Broker(positions=[{"contractId": CID, "size": 1}])
         await self.scan(broker)
-        self.assertEqual(len(broker.orders), 1)
-        # One slot left, so it goes to the STRONGEST eligible level (CMM 97),
-        # not the nearest one (CDM 99). See LEVEL_STRENGTH.
-        self.assertEqual(broker.orders[0]["limitPrice"], 97)
+        self.assertEqual(self.mutations(broker), [])
         # Opposite-side, multi-contract working order consumes cap too.
         engine.state.pending_entries.clear()
         broker = Broker([order(side=1, size=2)])
@@ -437,16 +435,41 @@ class OrderTests(BaseTests, unittest.IsolatedAsyncioTestCase):
         self.assertEqual([name for name, _ in sells], ["CMM", "PMM", "CDM", "PDM"])
 
     async def test_contract_cap_is_spent_on_strongest_levels(self):
-        # All four means eligible below price; the 2-contract cap must buy the
-        # two strongest (CMM, PMM), never the two nearest (CDM, PDM).
+        # All four means eligible below price; the 1-lot per-symbol cap must buy
+        # the STRONGEST level (CMM 97), never the nearest (CDM 99).
         engine.state.pdm["MES"] = 98
         engine.state.cmm["MES"] = 97
         engine.state.pmm["MES"] = 96
         broker = Broker()
         await self.scan(broker)
-        self.assertEqual(sorted(o["limitPrice"] for o in broker.orders), [96, 97])
-        self.assertEqual(
-            sorted(key[1] for key in engine.state.pending_entries), ["CMM", "PMM"]
+        self.assertEqual([o["limitPrice"] for o in broker.orders], [97])
+        self.assertEqual(list(engine.state.pending_entries), [("MES", "CMM")])
+
+    async def test_total_cap_counts_other_symbols(self):
+        # Exposure on OTHER contracts must consume the account-wide cap, or five
+        # symbols each spend their own allowance and breach the combine together.
+        engine.state.cmm["MES"] = 97
+        other = "CON.F.US.MCL.X26"
+        broker = Broker(
+            [order(contract=other, size=2)],
+            [{"contractId": "CON.F.US.MYM.Z26", "size": 3}],
+        )
+        await self.scan(broker)
+        self.assertEqual(self.mutations(broker), [])
+
+    async def test_total_cap_allows_placement_with_room_left(self):
+        engine.state.cmm["MES"] = 97
+        broker = Broker(positions=[{"contractId": "CON.F.US.MYM.Z26", "size": 3}])
+        await self.scan(broker)
+        self.assertEqual(len(broker.orders), 1)
+
+    def test_total_cap_matches_combine_and_bounds_per_symbol(self):
+        self.assertEqual(engine.MAX_TOTAL_CONTRACTS, 5)
+        self.assertGreaterEqual(engine.MAX_TOTAL_CONTRACTS, engine.MAX_CONTRACTS_PER_INSTRUMENT)
+        # Every symbol armed at its per-symbol cap must not exceed the account cap.
+        self.assertLessEqual(
+            engine.MAX_CONTRACTS_PER_INSTRUMENT * len(engine.SYMBOLS),
+            engine.MAX_TOTAL_CONTRACTS,
         )
 
     async def test_reprice_at_cap_does_not_add_exposure(self):

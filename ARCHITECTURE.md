@@ -171,7 +171,8 @@ slots on essentially every scan and CMM/PMM were never armed.
 
 | Guard | Value / behaviour |
 |---|---|
-| Contracts per instrument | `2` — shared budget with the VWAP engine, counted from broker truth (positions + working orders, either side) |
+| Contracts per instrument | `1` — counted from broker truth (positions + working entry orders, either side) |
+| Contracts per account | `5` — 50K combine max position, summed across all symbols |
 | Contracts per order | `1` |
 | Broker query failure | place nothing this cycle |
 | Mean refresh failure | raises; placement skipped |

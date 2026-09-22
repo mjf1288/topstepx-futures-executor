@@ -337,6 +337,11 @@ async def main() -> int:
 
     # ── Cycle 5: a cancellation also clears it ──
     print("\n── cycle 5: cancel an entry, expect pending_entries to clear ──")
+    # Flatten the filled lot first. The per-symbol cap is 1, so while that
+    # position is open the engine correctly refuses to rest another entry and
+    # there would be nothing to cancel.
+    broker.positions.pop(contract_id, None)
+    await engine._scan_and_place(SYMBOL, price, client, account, source="test")
     remaining = [k for k in engine.state.pending_entries if k[0] == SYMBOL]
     if remaining:
         ckey = remaining[0]
