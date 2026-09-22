@@ -207,14 +207,24 @@ def refresh_broker_means(client, symbol, now_utc=None):
     return values
 
 
+# Documented mean-level strength: CMM strongest, PDM weakest. The 60s scan
+# places orders in THIS order, so when MAX_CONTRACTS_PER_INSTRUMENT is reached
+# the cap is spent on the strongest levels available. Before 2026-09-22 the
+# scan walked plain dict order (CDM, PDM, CMM, PMM), so with a 2-contract cap
+# the two WEAKEST levels claimed both slots on every scan and CMM/PMM were
+# never armed while a nearer daily mean was eligible.
+LEVEL_STRENGTH = {'CMM': 4, 'PMM': 3, 'CDM': 2, 'PDM': 1}
+
+
 def get_all_eligible_levels(symbol, mode, price, tick_size):
-    """Get all mean levels eligible for entry in the given mode.
+    """Get all mean levels eligible for entry, strongest level first.
 
     A BUY LIMIT must be BELOW current price (else fills instantly at market).
     A SELL LIMIT must be ABOVE current price (same reason).
 
     The engine re-checks every 60 seconds, so as price moves, new levels
-    become eligible and get orders placed automatically.
+    become eligible and get orders placed automatically. Results are ordered by
+    LEVEL_STRENGTH so a contract cap never starves a stronger level.
     """
     # All four means now enabled. PMM was re-enabled 2026-08-05 after a
     # fresh audit vs raw ProjectX data confirmed engine PMM matched truth
@@ -236,6 +246,7 @@ def get_all_eligible_levels(symbol, mode, price, tick_size):
             result.append((name, entry))
         elif mode == 'SELL' and entry > price:
             result.append((name, entry))
+    result.sort(key=lambda item: -LEVEL_STRENGTH[item[0]])
     return result
 
 
@@ -475,8 +486,12 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         # Rebuild: for each mean level, find any broker limit order for this
         # symbol/side within 20 ticks of the level's price. Attach it as our
         # order for that level so cancel+replace works.
+        # `eligible` stays in LEVEL_STRENGTH order: it drives PLACEMENT, so the
+        # contract cap is spent on the strongest levels. Adoption below walks a
+        # distance-sorted copy instead, so a resting broker order is claimed by
+        # the level it actually sits closest to.
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
-        eligible.sort(key=lambda level: abs(level[1] - close))
+        by_distance = sorted(eligible, key=lambda level: abs(level[1] - close))
         eligible_names = {name for name, _ in eligible}
         # A disappeared/warm-up/wrong-side mean must not leave an old limit.
         for key in list(state.pending_entries):
@@ -486,7 +501,7 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
                 if await cancel_pending_entry(client, account, key):
                     open_order_count -= size
                     orders = [o for o in orders if str(o['id']) != order_id]
-        for level_name, entry_price in eligible:
+        for level_name, entry_price in by_distance:
             key = (symbol, level_name)
             if key in state.pending_entries:
                 continue  # already tracked

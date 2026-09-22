@@ -410,12 +410,36 @@ class OrderTests(BaseTests, unittest.IsolatedAsyncioTestCase):
         broker = Broker(positions=[{"contractId": CID, "size": 1}])
         await self.scan(broker)
         self.assertEqual(len(broker.orders), 1)
-        self.assertEqual(broker.orders[0]["limitPrice"], 99)
+        # One slot left, so it goes to the STRONGEST eligible level (CMM 97),
+        # not the nearest one (CDM 99). See LEVEL_STRENGTH.
+        self.assertEqual(broker.orders[0]["limitPrice"], 97)
         # Opposite-side, multi-contract working order consumes cap too.
         engine.state.pending_entries.clear()
         broker = Broker([order(side=1, size=2)])
         await self.scan(broker)
         self.assertEqual(self.mutations(broker), [])
+
+    def test_eligible_levels_ordered_by_documented_strength(self):
+        engine.state.pdm["MES"] = 98
+        engine.state.cmm["MES"] = 97
+        engine.state.pmm["MES"] = 96
+        levels = engine.get_all_eligible_levels("MES", "BUY", 100, 0.25)
+        self.assertEqual([name for name, _ in levels], ["CMM", "PMM", "CDM", "PDM"])
+        sells = engine.get_all_eligible_levels("MES", "SELL", 90, 0.25)
+        self.assertEqual([name for name, _ in sells], ["CMM", "PMM", "CDM", "PDM"])
+
+    async def test_contract_cap_is_spent_on_strongest_levels(self):
+        # All four means eligible below price; the 2-contract cap must buy the
+        # two strongest (CMM, PMM), never the two nearest (CDM, PDM).
+        engine.state.pdm["MES"] = 98
+        engine.state.cmm["MES"] = 97
+        engine.state.pmm["MES"] = 96
+        broker = Broker()
+        await self.scan(broker)
+        self.assertEqual(sorted(o["limitPrice"] for o in broker.orders), [96, 97])
+        self.assertEqual(
+            sorted(key[1] for key in engine.state.pending_entries), ["CMM", "PMM"]
+        )
 
     async def test_reprice_at_cap_does_not_add_exposure(self):
         engine.state.pending_entries[("MES", "CDM")] = pending()
