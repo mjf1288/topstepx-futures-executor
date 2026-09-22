@@ -320,7 +320,12 @@ class TopstepAPI:
         }
 
         data = self._post("/History/retrieveBars", payload)
-        return data.get("bars", [])
+        if not isinstance(data, dict) or data.get("success") is False:
+            raise TopstepAPIError("History/retrieveBars returned an unsuccessful response")
+        bars = data.get("bars")
+        if not isinstance(bars, list):
+            raise TopstepAPIError("History/retrieveBars returned missing/null/invalid bars")
+        return bars
 
     # ─────────────────────────────────────────────────────────────
     # Orders

@@ -1,7 +1,7 @@
 """
 Tzu Strategic Momentum — Real-Time Mean Level Execution Engine
 ===============================================================
-Streams live 5-min bars, computes running CDM dynamically, and places
+Streams prices, recomputes four means from completed broker bars every 60s, and places
 limit orders at the closest mean level in the direction you choose.
 
 Usage:
@@ -11,7 +11,7 @@ Usage:
 
 The mode (BUY or SELL) is set by you. The engine handles execution:
   - Streams 5-min bars via WebSocket
-  - Recomputes CDM after every bar close
+  - Recomputes CDM/PDM from broker 5-min bars and CMM/PMM from broker hourly bars
   - Places/adjusts limit entry at the closest mean level
   - EXECUTION-ONLY: places ENTRY LIMITs only. User attaches stops/targets
     manually on the TopstepX UI. (Bracket placement removed 2026-07-23
@@ -23,6 +23,7 @@ import asyncio
 import argparse
 import json
 import logging
+import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -47,8 +48,8 @@ load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
 SYMBOLS = ["MNQ", "MES", "MYM", "MGC", "MCL"]
 
 CONTRACT_MAP = {
-    'MNQ': ('CON.F.US.MNQ.U26', 'CON.F.US.MNQ.Z26', 0.25, 0.50),
-    'MES': ('CON.F.US.MES.U26', 'CON.F.US.MES.Z26', 0.25, 1.25),
+    'MNQ': ('CON.F.US.MNQ.Z26', 'CON.F.US.MNQ.U26', 0.25, 0.50),
+    'MES': ('CON.F.US.MES.Z26', 'CON.F.US.MES.U26', 0.25, 1.25),
     'MYM': ('CON.F.US.MYM.U26', 'CON.F.US.MYM.Z26', 1.0, 0.50),
     'MGC': ('CON.F.US.MGC.V26', 'CON.F.US.MGC.Z26', 0.10, 1.00),
     # MCL (Micro Crude Oil) rolls monthly — update these first-of-each-month.
@@ -72,7 +73,7 @@ RR_RATIO = 2.618                   # Golden ratio R:R
 # equals current price and triggers instant-fill limits with no edge.
 # Observed bug: 2026-06-01 globex open filled at CMM on first 5m bar.
 MIN_SAMPLES_CDM = 6   # ~30 min of 5-min bars before publishing CDM
-MIN_SAMPLES_CMM = 24  # ~2 hours into a new month before publishing CMM
+MIN_SAMPLES_CMM = 24  # 24 completed hourly bars; preserve existing warm-up gate
 
 ET = pytz.timezone("America/New_York")
 CT = pytz.timezone("America/Chicago")
@@ -99,10 +100,7 @@ class State:
         self.session_day = None   # Track which session day we're in
         self.current_day = None
         self.current_month = None
-        # Tracks last hour (ET) we refreshed CMM/PMM from fresh hourly bars.
-        # Prevents multiple refreshes per hour if the monitor loop wakes up
-        # more than once during the same :00 minute.
-        self.last_monthly_refresh_hour = None
+        self.refresh_locks = defaultdict(asyncio.Lock)
 
 
 state = State()
@@ -125,120 +123,88 @@ def get_futures_month(ct_time):
 # ─────────────────────────────────────────────────────────────
 # RUNNING MEAN LEVELS
 # ─────────────────────────────────────────────────────────────
-def update_running_means(symbol, close, timestamp):
-    """Update CDM (current-day mean) with a new 5-min bar close.
+def prior_month_start_utc(now_utc):
+    """Start of the entire previous futures month, including its 5pm CT open."""
+    year, month = get_futures_month(now_utc.astimezone(CT))
+    first = datetime(year, month, 1)
+    prior_first = (first - timedelta(days=1)).replace(day=1)
+    # Do calendar arithmetic BEFORE localizing so DST cannot shift the open.
+    session_open = (prior_first - timedelta(days=1)).replace(hour=17)
+    return CT.localize(session_open).astimezone(timezone.utc)
 
-    NOTE (2026-08-05): CMM/PMM are NO LONGER updated here. Historical
-    bug: this function was appending 5-min closes to state.month_closes,
-    which had been seeded from HOURLY bars. Mixing granularities gave
-    each 5-min close 12x more weight than an hourly bar and drifted CMM
-    by 1-1.6% within 2 weeks of continuous running. CMM/PMM are now
-    refreshed from fresh hourly API pulls in refresh_monthly_means()
-    once per hour.
+
+def completed_bars(bars, start, end, minutes):
+    """Normalize, deduplicate and exclude partial/out-of-window broker bars."""
+    if not isinstance(bars, list) or not bars:
+        raise ValueError("Broker returned no usable bar history")
+    by_time = {}
+    for bar in bars:
+        ts = datetime.fromisoformat(bar['t'].replace('Z', '+00:00'))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        ts = ts.astimezone(timezone.utc)
+        if start <= ts and ts + timedelta(minutes=minutes) <= end:
+            if not math.isfinite(float(bar['c'])):
+                raise ValueError("Broker bar has a non-finite close")
+            by_time[ts] = bar
+    return sorted(by_time.items())
+
+
+def refresh_broker_means(client, symbol, now_utc=None):
+    """Replace all four means atomically from fresh, completed broker bars.
+
+    No local tick aggregate or prior cached mean contributes to these values.
+    Both requests must succeed before publishing any state. Empty/missing
+    period buckets clear that period's old value rather than leaking it across
+    a day/month roll. A failed request raises, so the caller skips placement.
     """
-    # Defensive: if timestamp is naive (no tz info), assume UTC. Some SDK
-    # bar events have inconsistent timezone metadata.
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    ct_time = timestamp.astimezone(CT)
-    today = get_futures_day(ct_time)
-    this_month = get_futures_month(ct_time)
-
-    # DIAGNOSTIC: log the day-key transition the first time a new bar
-    # comes in, so we can spot seed/realtime key mismatches.
-    day_key = (symbol, today)
-    prev_n = len(state.day_closes.get(day_key, []))
-    if prev_n == 0:
-        existing_keys = [k for k in state.day_closes.keys() if k[0] == symbol]
-        print(f"  [{symbol}] NEW day-key {today} (close={close:.2f}, ct={ct_time.isoformat()}) "
-              f"— existing keys for this symbol: {existing_keys}")
-
-    # Day roll — save yesterday's CDM as PDM
-    if state.current_day and state.current_day != today:
-        for sym in SYMBOLS:
-            prev_key = (sym, state.current_day)
-            if prev_key in state.day_closes and state.day_closes[prev_key]:
-                closes = state.day_closes[prev_key]
-                state.pdm[sym] = sum(closes) / len(closes)
-
-    state.current_day = today
-    state.current_month = this_month
-
-    # Accumulate ONLY day closes here. Month-level CMM/PMM are refreshed
-    # from fresh hourly API pulls (see refresh_monthly_means()).
-    day_key = (symbol, today)
-    state.day_closes[day_key].append(close)
-
-    day_count = len(state.day_closes[day_key])
-    if day_count >= MIN_SAMPLES_CDM:
-        state.cdm[symbol] = sum(state.day_closes[day_key]) / day_count
-    else:
-        state.cdm[symbol] = None  # warm-up
-
-
-def refresh_monthly_means(client):
-    """Refresh CMM and PMM from fresh HOURLY bars via the ProjectX API.
-
-    Called at engine startup (via seed_historical) AND periodically by the
-    monitor loop (once per hour, see main()). This is the ONLY code path
-    that mutates state.cmm and state.pmm. Live 5-min bars no longer
-    contribute to these means — they only update CDM.
-
-    Rationale: the previous implementation appended live 5-min closes to
-    a bucket that had been seeded from hourly bars, over-weighting the
-    5-min samples by 12x and drifting CMM by ~1% per week (audit
-    performed 2026-08-05 showed engine CMM off by +1.0% to +1.6% for
-    MNQ / MES / MYM after 2 weeks of continuous running).
-    """
-    import requests as sync_requests
-    token = client.get_session_token()
-    base_url = client.base_url
-    headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
-
-    now_utc = datetime.now(timezone.utc)
-    now_ct = now_utc.astimezone(CT)
-    this_month = get_futures_month(now_ct)
+    now_utc = now_utc or datetime.now(timezone.utc)
+    today = get_futures_day(now_utc.astimezone(CT))
+    this_month = get_futures_month(now_utc.astimezone(CT))
     prev_m = (this_month[0], this_month[1] - 1) if this_month[1] > 1 else (this_month[0] - 1, 12)
+    day_start = now_utc - timedelta(days=7)
+    month_start = prior_month_start_utc(now_utc)
+    cid = CONTRACT_MAP[symbol][0]
+    daily_bars = completed_bars(client.get_bars(
+        contract_id=cid, unit=2, unit_number=5,
+        start_time=day_start, end_time=now_utc, limit=5000,
+        include_partial=False,
+    ), day_start, now_utc, 5)
+    hourly_bars = completed_bars(client.get_bars(
+        contract_id=cid, unit=3, unit_number=1,
+        start_time=month_start, end_time=now_utc, limit=5000,
+        include_partial=False,
+    ), month_start, now_utc, 60)
+    if not daily_bars or not hourly_bars:
+        raise ValueError(f"{symbol}: no completed broker bars in requested window")
 
-    for sym in SYMBOLS:
-        if sym not in CONTRACT_MAP:
-            continue
-        curr = CONTRACT_MAP[sym][0]
-        try:
-            resp = sync_requests.post(
-                f'{base_url}/History/retrieveBars',
-                json={
-                    "contractId": curr, "live": False,
-                    "startTime": (now_utc - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    # includePartialBar=False: partial bars have a live 'close' that
-                    # keeps changing until the bar completes. Averaging them into the
-                    # running mean corrupts CMM (each refresh injects a new pseudo-close
-                    # for the same bar-in-progress, over-weighting recent price).
-                    "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": False,
-                },
-                headers=headers, timeout=15,
-            )
-            hourly = resp.json().get('bars') or []
-        except Exception as e:
-            print(f"  [{sym}] CMM/PMM refresh failed: {e!r}")
-            continue
+    days, months = defaultdict(list), defaultdict(list)
+    for ts, bar in daily_bars:
+        days[get_futures_day(ts.astimezone(CT))].append(float(bar['c']))
+    for ts, bar in hourly_bars:
+        months[get_futures_month(ts.astimezone(CT))].append(float(bar['c']))
+    prior_days = sorted(day for day in days if day < today)
+    previous = days[prior_days[-1]] if prior_days else []
 
-        month_data = defaultdict(list)
-        for b in hourly:
-            try:
-                ts = datetime.fromisoformat(b['t'].replace('Z', '+00:00')).astimezone(CT)
-            except Exception:
-                continue
-            fm = get_futures_month(ts)
-            month_data[fm].append(b['c'])
+    def mean(values, minimum=1):
+        return sum(values) / len(values) if len(values) >= minimum else None
 
-        if this_month in month_data and len(month_data[this_month]) >= MIN_SAMPLES_CMM:
-            state.cmm[sym] = sum(month_data[this_month]) / len(month_data[this_month])
-        elif this_month in month_data:
-            state.cmm[sym] = None  # warm-up
-        if prev_m in month_data and len(month_data[prev_m]) > 0:
-            state.pmm[sym] = sum(month_data[prev_m]) / len(month_data[prev_m])
+    values = {
+        'CDM': mean(days[today], MIN_SAMPLES_CDM),
+        'PDM': mean(previous),
+        'CMM': mean(months[this_month], MIN_SAMPLES_CMM),
+        'PMM': mean(months[prev_m]),
+    }
+    for name, value in values.items():
+        getattr(state, name.lower())[symbol] = value
+    # Replace, never append, so repeated fetches cannot double-count a close.
+    for key in list(state.day_closes):
+        if key[0] == symbol:
+            del state.day_closes[key]
+    state.day_closes.update({(symbol, day): closes for day, closes in days.items()})
+    state.current_day, state.current_month = today, this_month
+    state.current_price.setdefault(symbol, float(daily_bars[-1][1]['c']))
+    return values
 
 
 def get_all_eligible_levels(symbol, mode, price, tick_size):
@@ -247,7 +213,7 @@ def get_all_eligible_levels(symbol, mode, price, tick_size):
     A BUY LIMIT must be BELOW current price (else fills instantly at market).
     A SELL LIMIT must be ABOVE current price (same reason).
 
-    The engine re-checks every 5-min bar, so as price moves, new levels
+    The engine re-checks every 60 seconds, so as price moves, new levels
     become eligible and get orders placed automatically.
     """
     # All four means now enabled. PMM was re-enabled 2026-08-05 after a
@@ -277,7 +243,7 @@ def get_all_eligible_levels(symbol, mode, price, tick_size):
 # ORDER MANAGEMENT
 # ─────────────────────────────────────────────────────────────
 async def place_or_update_entry(client, account, symbol, level_name, contract_id, side, entry_price, tick_size):
-    """Place or update entry limit for a specific symbol+level."""
+    """Place/update an entry; return True only after successful placement."""
     import aiohttp
     token = client.get_session_token()
     base_url = client.base_url
@@ -286,14 +252,11 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
 
     existing = state.pending_entries.get(key)
     if existing:
-        if abs(entry_price - existing['entry_price']) < tick_size * 2:
-            return  # Level hasn't moved enough
+        if round(entry_price / tick_size) == round(existing['entry_price'] / tick_size):
+            return False  # Same executable price; even one tick merits repricing.
         # Cancel old
-        if not state.dry_run:
-            async with aiohttp.ClientSession() as http:
-                await http.post(f'{base_url}/Order/cancel',
-                    json={'orderId': existing['order_id'], 'accountId': account.id},
-                    headers=hdrs)
+        if not await cancel_pending_entry(client, account, key):
+            return False
         print(f"  [{symbol}] {level_name} moved: {existing['entry_price']} -> {entry_price}")
 
     side_str = 'BUY' if side == 0 else 'SELL'
@@ -311,7 +274,7 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
             'order_id': 'DRY', 'entry_price': entry_price,
             'side': side, 'contract_id': contract_id, 'level': level_name,
         }
-        return
+        return True
 
     # ══ EXECUTION-ONLY MODE ═════════════════════════════════════════════════
     # Engine places the ENTRY LIMIT only. Once filled, YOU are responsible
@@ -319,13 +282,15 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
     # places brackets. Cap enforcement continues to prevent overexposure.
     # ═══════════════════════════════════════════════════════════════════
     async with aiohttp.ClientSession() as http:
-        r = await (await http.post(f'{base_url}/Order/place', json={
+        response = await http.post(f'{base_url}/Order/place', json={
             'accountId': account.id, 'contractId': contract_id,
             'type': 1, 'side': side, 'size': CONTRACTS_PER_ORDER, 'limitPrice': entry_price,
-        }, headers=hdrs)).json()
+        }, headers=hdrs)
+        response.raise_for_status()
+        r = await response.json()
         if not r.get('success'):
             print(f"  [{symbol}] {level_name} entry failed: {r}")
-            return
+            return False
         entry_id = r['orderId']
 
     state.pending_entries[key] = {
@@ -334,6 +299,38 @@ async def place_or_update_entry(client, account, symbol, level_name, contract_id
         'side': side, 'contract_id': contract_id, 'level': level_name,
     }
     print(f"  [{symbol}] {side_str} {level_name} @ {entry_price} ({ref_stop_str}) — attach stop manually on TopstepX")
+    return True
+
+
+async def cancel_pending_entry(client, account, key):
+    """Forget an entry only after a confirmed cancellation (never in doubt)."""
+    import aiohttp
+    entry = state.pending_entries[key]
+    if not state.dry_run:
+        async with aiohttp.ClientSession() as http:
+            response = await http.post(
+                f'{client.base_url}/Order/cancel',
+                json={'orderId': entry['order_id'], 'accountId': account.id},
+                headers={'Authorization': f'Bearer {client.get_session_token()}',
+                         'Content-Type': 'application/json'},
+            )
+            response.raise_for_status()
+            result = await response.json()
+        if result.get('success') is not True:
+            print(f"  [{key[0]}] cancel unconfirmed for {entry['order_id']}; no replacement")
+            return False
+    del state.pending_entries[key]
+    return True
+
+
+def broker_rows(payload, field):
+    """Do not treat HTTP-200 broker errors/malformed payloads as empty state."""
+    if isinstance(payload, list):
+        return payload
+    if (not isinstance(payload, dict) or payload.get('success') is False
+            or not isinstance(payload.get(field), list)):
+        raise ValueError(f"Invalid broker {field} response")
+    return payload[field]
 
 
 # ─────────────────────────────────────────────────────────────
@@ -357,43 +354,23 @@ async def check_and_bracket_fills(client, account):
 # BAR HANDLER
 # ─────────────────────────────────────────────────────────────
 async def on_new_bar(symbol, bar_data, client, account):
-    """Process a new 5-min bar. Place/update orders at ALL eligible levels."""
-    try:
-        close = bar_data['close']
-        state.current_price[symbol] = close
-        update_running_means(symbol, close, bar_data['timestamp'])
-        await check_and_bracket_fills(client, account)
+    """Local tick bars are a price hint only, NEVER an input to mean levels."""
+    state.current_price[symbol] = bar_data['close']
 
-        cdm = state.cdm.get(symbol)
-        cdm_str = f"{cdm:.2f}" if cdm else "?"
-        print(f"  [{symbol}] {close:.2f} | CDM: {cdm_str}")
 
-        # Delegate to shared placement logic (also called by the 60s reprice tick).
-        await _scan_and_place(symbol, close, client, account, source="5m_bar")
-
-    except Exception as e:
-        print(f"  [{symbol}] Error (non-fatal): {e}")
+async def refresh_and_reprice(symbol, client, account, now_utc=None):
+    """One serialized 60s cycle: broker means first, order reconciliation second."""
+    async with state.refresh_locks[symbol]:
+        await asyncio.to_thread(refresh_broker_means, client, symbol, now_utc)
+        price = state.current_price.get(symbol)
+        if price is not None:
+            await _scan_and_place(symbol, price, client, account, source="1m_tick")
 
 
 async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
-    """Scan eligible levels and place/update entry limit orders.
-
-    Called from:
-      - on_new_bar()   every 5 min (source='5m_bar')  — after new CDM is computed
-      - main() loop    every 60 s  (source='1m_tick') — keeps orders synced when
-                                                        the 5-min bar hasn't closed yet
-
-    The 60s reprice does NOT recompute CDM/PDM/CMM/PMM; it uses the existing
-    state values. The point is to (a) recover any orders the broker canceled
-    or dropped, and (b) reprice a level if CMM/PMM refresh moved it > 2 ticks
-    since the last placement.
-    """
+    """Reconcile broker orders and reprice only after a successful mean refresh."""
     try:
         tick_size = CONTRACT_MAP[symbol][2]
-        cdm = state.cdm.get(symbol)
-        if not cdm:
-            return
-
         # Weekend filter only (market closed)
         et_now = datetime.now(ET)
         if (et_now.weekday() == 4 and et_now.hour >= 18) or et_now.weekday() == 5:
@@ -433,60 +410,60 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         base_url = client.base_url
         hdrs = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
 
-        # Count open positions for this instrument.
-        # NOTE: TopstepX API requires POST with json body. Previously used
-        # GET with params= which returned an error shape — isinstance check
-        # then failed silently and open_pos_count stayed at 0. That made the
-        # cap effectively count only working orders, which vanish on fill,
-        # so the engine could accumulate positions beyond the cap.
+        # Count open limit orders for this instrument (entry orders only, type=1=Limit)
+        open_order_count = 0
+        ord_query_ok = False
+        try:
+            async with aiohttp.ClientSession() as http:
+                resp = await http.post(f'{base_url}/Order/searchOpen',
+                                       json={'accountId': account.id}, headers=hdrs)
+                resp.raise_for_status()
+                ord_data = await resp.json()
+            orders = broker_rows(ord_data, 'orders')
+            for o in orders:
+                if o.get('contractId', '') == contract_id and o.get('type') == 1:
+                    open_order_count += abs(o.get('size', 1))
+            ord_query_ok = True
+        except Exception as e:
+            print(f"  [{symbol}] SKIP — order query failed: {e!r}")
+
+        # Read positions AFTER orders. If an entry filled between these reads,
+        # it is counted conservatively in both snapshots, not missed in both.
         open_pos_count = 0
         pos_query_ok = False
         try:
             async with aiohttp.ClientSession() as http:
                 resp = await http.post(f'{base_url}/Position/searchOpen',
                                        json={'accountId': account.id}, headers=hdrs)
+                resp.raise_for_status()
                 pos_data = await resp.json()
-            pos_query_ok = True
-            if isinstance(pos_data, dict):
-                positions = pos_data.get('positions', [])
-            elif isinstance(pos_data, list):
-                positions = pos_data
-            else:
-                positions = []
+            positions = broker_rows(pos_data, 'positions')
             for p in positions:
                 if p.get('contractId', '') == contract_id:
                     open_pos_count += abs(p.get('size', 0))
+            pos_query_ok = True
         except Exception as e:
             print(f"  [{symbol}] SKIP — position query failed: {e!r}")
-
-        # Count open limit orders for this instrument (entry orders only, type=1=Limit)
-        open_order_count = 0
-        existing_order_prices = set()
-        ord_query_ok = False
-        try:
-            async with aiohttp.ClientSession() as http:
-                resp = await http.post(f'{base_url}/Order/searchOpen',
-                                       json={'accountId': account.id}, headers=hdrs)
-                ord_data = await resp.json()
-            ord_query_ok = True
-            if isinstance(ord_data, dict):
-                orders = ord_data.get('orders', [])
-            elif isinstance(ord_data, list):
-                orders = ord_data
-            else:
-                orders = []
-            for o in orders:
-                if o.get('contractId', '') == contract_id and o.get('type') == 1 and o.get('side') == side:
-                    open_order_count += 1
-                    if o.get('limitPrice'):
-                        existing_order_prices.add(round(o['limitPrice'], 2))
-        except Exception as e:
-            print(f"  [{symbol}] SKIP — order query failed: {e!r}")
 
         # Hard rule: if EITHER query failed, do not place new orders this bar.
         # The cap is only meaningful when we can see both positions and orders.
         if not (pos_query_ok and ord_query_ok):
             return
+
+        # Filled/cancelled/expired orders disappear from searchOpen. Prune
+        # before adoption AND price dedup, using the same validated snapshot.
+        open_by_id = {str(o['id']): o for o in orders}
+        for key, entry in list(state.pending_entries.items()):
+            if key[0] != symbol:
+                continue
+            if state.dry_run and entry['order_id'] == 'DRY':
+                open_order_count += CONTRACTS_PER_ORDER
+                continue
+            broker_order = open_by_id.get(str(entry['order_id']))
+            if broker_order is None:
+                del state.pending_entries[key]
+            elif broker_order.get('limitPrice') is not None:
+                entry['entry_price'] = float(broker_order['limitPrice'])
 
         # RECONCILE state.pending_entries from broker reality on every tick.
         # Prior bug: engine tracked orders only in memory; on restart, the
@@ -499,6 +476,16 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
         # symbol/side within 20 ticks of the level's price. Attach it as our
         # order for that level so cancel+replace works.
         eligible = get_all_eligible_levels(symbol, mode, close, tick_size)
+        eligible.sort(key=lambda level: abs(level[1] - close))
+        eligible_names = {name for name, _ in eligible}
+        # A disappeared/warm-up/wrong-side mean must not leave an old limit.
+        for key in list(state.pending_entries):
+            if key[0] == symbol and key[1] not in eligible_names:
+                order_id = str(state.pending_entries[key]['order_id'])
+                size = open_by_id.get(order_id, {}).get('size', CONTRACTS_PER_ORDER)
+                if await cancel_pending_entry(client, account, key):
+                    open_order_count -= size
+                    orders = [o for o in orders if str(o['id']) != order_id]
         for level_name, entry_price in eligible:
             key = (symbol, level_name)
             if key in state.pending_entries:
@@ -506,17 +493,7 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
             # Find nearest broker order to this level within 20 ticks
             best = None
             best_dist = tick_size * 20  # 20-tick tolerance
-            broker_orders_snapshot = []
-            try:
-                async with aiohttp.ClientSession() as http:
-                    resp = await http.post(f'{base_url}/Order/searchOpen',
-                                           json={'accountId': account.id}, headers=hdrs)
-                    od = await resp.json()
-                broker_orders_snapshot = (od.get('orders', []) if isinstance(od, dict)
-                                          else (od if isinstance(od, list) else []))
-            except Exception:
-                broker_orders_snapshot = []
-            for bo in broker_orders_snapshot:
+            for bo in orders:
                 if bo.get('contractId') != contract_id: continue
                 if bo.get('type') != 1: continue
                 if bo.get('side') != side: continue
@@ -549,10 +526,13 @@ async def _scan_and_place(symbol, close, client, account, source: str = "tick"):
             has_existing_order = key in state.pending_entries
             # If no existing order tracked AND we've hit position cap, skip
             # placing a brand-new order (would be rejected anyway).
-            if not has_existing_order and open_pos_count >= MAX_CONTRACTS_PER_INSTRUMENT:
+            if (not has_existing_order and
+                    open_pos_count + open_order_count + CONTRACTS_PER_ORDER > MAX_CONTRACTS_PER_INSTRUMENT):
                 continue
-            await place_or_update_entry(client, account, symbol, level_name,
-                                        contract_id, side, entry_price, tick_size)
+            placed = await place_or_update_entry(client, account, symbol, level_name,
+                                                 contract_id, side, entry_price, tick_size)
+            if placed and not has_existing_order:
+                open_order_count += CONTRACTS_PER_ORDER
 
     except Exception as e:
         print(f"  [{symbol}] scan error ({source}) (non-fatal): {e}")
@@ -568,32 +548,9 @@ def seed_historical(client):
     base_url = client.base_url
     headers = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
     now_utc = datetime.now(timezone.utc)
-    now_ct = datetime.now(CT)
+    now_ct = now_utc.astimezone(CT)
     today = get_futures_day(now_ct)
     this_month = get_futures_month(now_ct)
-
-    # Session start = 5 PM CT yesterday (or today if after 5 PM)
-    if now_ct.hour >= 17:
-        session_start = now_ct.replace(hour=17, minute=0, second=0, microsecond=0)
-    else:
-        session_start = (now_ct - timedelta(days=1)).replace(hour=17, minute=0, second=0, microsecond=0)
-    session_start_utc = session_start.astimezone(timezone.utc)
-
-    # Previous TRADING session start. CME futures close Fri 4pm CT, reopen Sun 5pm CT.
-    # So on a Monday morning the previous session is Friday, not Sunday.
-    # We walk back day-by-day skipping Sat (weekday=5) and Sun (weekday=6),
-    # also handling Monday holidays by extending the search window.
-    prev_start = session_start - timedelta(days=1)
-    # If prev_start lands on Saturday (weekday=5) or Sunday (weekday=6),
-    # walk back to Friday.
-    while prev_start.weekday() >= 5:
-        prev_start -= timedelta(days=1)
-    prev_start_utc = prev_start.astimezone(timezone.utc)
-    # Pull a wider window so a Monday holiday (Memorial Day, Labor Day,
-    # July 4, etc.) doesn't leave PDM empty — we'll fall back to the
-    # most recent session with actual bars.
-    fetch_start = prev_start - timedelta(days=4)
-    fetch_start_utc = fetch_start.astimezone(timezone.utc)
 
     active = list(state.modes.keys()) if hasattr(state, 'modes') and state.modes else SYMBOLS
     for sym in active:
@@ -602,82 +559,9 @@ def seed_historical(client):
             continue
         curr, prior, tick, tick_val = CONTRACT_MAP[sym]
 
-        # Fetch a wide window and filter locally — the History API
-        # does not reliably respect startTime, so we bucket bars by timestamp.
-        # unit=2 is MINUTE (unit=1 is Second, which is what we were wrongly using)
-        all_bars = sync_requests.post(f'{base_url}/History/retrieveBars', json={
-            "contractId": curr, "live": False,
-            "startTime": fetch_start_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            # includePartialBar=False: the seed pull must only contain completed bars.
-            # A partial bar here would corrupt state.day_closes with a moving 'close'.
-            "unit": 2, "unitNumber": 5, "limit": 5000, "includePartialBar": False,
-        }, headers=headers).json().get('bars') or []
-
-        # Bucket bars by FUTURES TRADING DAY (5pm CT roll). This handles
-        # weekends and holidays automatically — days with no bars don't
-        # appear as buckets at all, so 'previous trading day' = whichever
-        # bucket is one before today.
-        bars_today = []
-        bars_by_day = defaultdict(list)
-        for b in all_bars:
-            try:
-                ts = datetime.fromisoformat(b['t'].replace('Z', '+00:00'))
-            except Exception:
-                continue
-            if ts >= session_start_utc:
-                bars_today.append(b)
-            else:
-                # Group by futures trading day in CT
-                ts_ct = ts.astimezone(CT)
-                fday = get_futures_day(ts_ct)
-                bars_by_day[fday].append(b)
-
-        # CDM
-        if bars_today:
-            today_closes = [b['c'] for b in bars_today]
-            state.day_closes[(sym, today)] = today_closes
-            state.cdm[sym] = sum(today_closes) / len(today_closes)
-            print(f"  {sym} CDM: {state.cdm[sym]:.2f} ({len(today_closes)} bars)")
-
-        # PDM = most recent trading day BEFORE today with actual bars.
-        # Skips weekends, holidays automatically.
-        prior_days = sorted([d for d in bars_by_day.keys() if d < today], reverse=True)
-        if prior_days:
-            prev_trading_day = prior_days[0]
-            yd_closes = [b['c'] for b in bars_by_day[prev_trading_day]]
-            state.pdm[sym] = sum(yd_closes) / len(yd_closes)
-            print(f"  {sym} PDM: {state.pdm[sym]:.2f} ({len(yd_closes)} bars on {prev_trading_day})")
-        else:
-            print(f"  {sym} PDM: — (no prior session bars found in 5-day window)")
-
-        # CMM/PMM from hourly (current contract covers recent months)
-        hourly = sync_requests.post(f'{base_url}/History/retrieveBars', json={
-            "contractId": curr, "live": False,
-            "startTime": (now_utc - timedelta(days=45)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "endTime": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            # includePartialBar=False: partial hourly bars corrupt CMM/PMM.
-            "unit": 3, "unitNumber": 1, "limit": 5000, "includePartialBar": False,
-        }, headers=headers).json().get('bars') or []
-
-        month_data = defaultdict(list)
-        for b in hourly:
-            ts = datetime.fromisoformat(b['t']).astimezone(CT)
-            fm = get_futures_month(ts)
-            month_data[fm].append(b['c'])
-
-        # Seed CMM/PMM directly from fresh hourly bars — do NOT populate
-        # state.month_closes anymore. Live 5-min bars no longer contribute
-        # to CMM/PMM (see refresh_monthly_means() docstring). These values
-        # will be refreshed hourly in the main monitor loop.
-        if this_month in month_data:
-            state.cmm[sym] = sum(month_data[this_month]) / len(month_data[this_month])
-            print(f"  {sym} CMM: {state.cmm[sym]:.2f}")
-
-        prev_m = (this_month[0], this_month[1]-1) if this_month[1]>1 else (this_month[0]-1, 12)
-        if prev_m in month_data:
-            state.pmm[sym] = sum(month_data[prev_m]) / len(month_data[prev_m])
-            print(f"  {sym} PMM: {state.pmm[sym]:.2f}")
+        values = refresh_broker_means(client, sym, now_utc)
+        for name, value in values.items():
+            print(f"  {sym} {name}: {value:.2f}" if value is not None else f"  {sym} {name}: warm-up/no data")
 
         # ATR from last 3 trading days (adapts to recent volatility)
         daily = sync_requests.post(f'{base_url}/History/retrieveBars', json={
@@ -795,34 +679,29 @@ async def main(modes: dict, dry_run: bool = False):
         print(f"  STREAMING — {mode_lines}")
         print(f"  Ctrl+C to stop\n")
 
-        # Keep alive + monitor positions + hourly status + REPRICE
-        # every 60s so orders stay synced with current mean levels instead
-        # of only updating at 5-min bar close.
+        # Monotonic cadence avoids adding fetch duration to every 60s period.
+        next_refresh = loop.time() + 60
         while True:
-            await asyncio.sleep(60)
+            await asyncio.sleep(max(0, next_refresh - loop.time()))
+            next_refresh += 60
 
-            # ── 60s REPRICE ─────────────────────────────────────────────
-            # For each active symbol, re-run placement logic using the
-            # current state.cdm/pdm/cmm/pmm and current price. place_or_update_entry
-            # already handles: (a) dedup by price (skip if unchanged),
-            # (b) cancel + replace if moved > 2 ticks, (c) re-place if broker
-            # canceled it. So this call is cheap when nothing changed and
-            # self-heals when something did.
+            # Refresh all four means from completed broker bars BEFORE each
+            # order scan, even when no local ticks/bars arrived this minute.
             tick_ts = datetime.now(CT).strftime("%H:%M:%S CT")
             tick_summary = []
             for sym in list(state.modes.keys()):
-                px = state.current_price.get(sym)
-                if px is None:
-                    tick_summary.append(f"{sym}=nopx")
-                    continue
                 try:
-                    await _scan_and_place(sym, px, client, account, source="1m_tick")
+                    await refresh_and_reprice(sym, client, account)
+                    px = state.current_price.get(sym)
                     cdm = state.cdm.get(sym)
                     tick_summary.append(f"{sym}={px:.2f}/CDM={cdm:.2f}" if cdm else f"{sym}={px:.2f}/CDM=?")
                 except Exception as e:
                     print(f"  [{sym}] 60s reprice error: {e!r}")
                     tick_summary.append(f"{sym}=err")
             print(f"  ⏱  60s tick {tick_ts} — {' | '.join(tick_summary)}")
+            # Do not burst catch-up requests if the broker was slow.
+            if next_refresh <= loop.time():
+                next_refresh = loop.time() + 60
 
             # Check if any active positions were closed (stop/target hit)
             try:
@@ -869,22 +748,6 @@ async def main(modes: dict, dry_run: bool = False):
                         break  # Re-check next cycle
             except:
                 pass
-            # Once per hour, at :00, refresh CMM/PMM from fresh hourly bars.
-            # This is the ONLY code that writes state.cmm and state.pmm
-            # during a live session, and it fixes the drift bug (see
-            # refresh_monthly_means() docstring for details).
-            try:
-                et_now = datetime.now(ET)
-                if et_now.minute == 0 and et_now.second < 30:
-                    if state.last_monthly_refresh_hour != et_now.hour:
-                        try:
-                            refresh_monthly_means(client)
-                            state.last_monthly_refresh_hour = et_now.hour
-                        except Exception as e:
-                            print(f"  monthly refresh failed: {e!r}")
-            except Exception:
-                pass
-
             try:
                 et_now = datetime.now(ET)
                 if et_now.minute == 0:
