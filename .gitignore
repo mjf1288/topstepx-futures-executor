@@ -10,3 +10,7 @@ session_log_*.txt
 .DS_Store
 .env.bak
 *.bak
+
+# Market data store (lives outside the repo by default)
+topstep-data/
+*.tmp

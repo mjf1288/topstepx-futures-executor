@@ -12,6 +12,10 @@ python-dotenv>=1.0.0      # loads .env at startup
 pytz>=2024.1              # CT / ET timezone handling
 aiohttp>=3.9.0            # engine's async HTTP for order/position queries
 
+# ── Market data store (collect_data.py) ─────────────────────────────
+pandas>=2.1               # bar frames
+pyarrow>=14.0             # parquet files
+
 # ── Optional (nice-to-have) ─────────────────────────────────────────
 # polars                  # Not required. Was pulled in transitively by
 #                         # project-x-py; the new stack doesn't need it.
